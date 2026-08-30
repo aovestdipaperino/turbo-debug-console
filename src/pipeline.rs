@@ -102,9 +102,9 @@ impl Pipeline {
         self.stream.finish();
         self.drain(view);
         if let Some(line) = self.asm.flush() {
-            view.push_line(line);
+            view.push_line(&line);
         }
-        view.set_partial(Vec::new());
+        view.set_partial(&[]);
     }
 
     /// Moves whatever ANSI the renderer has produced into the view.
@@ -112,9 +112,9 @@ impl Pipeline {
         let ansi = std::mem::take(self.stream.sink_mut().renderer_mut().sink_mut());
         self.asm.push(&ansi);
         for line in self.asm.take_complete_lines() {
-            view.push_line(line);
+            view.push_line(&line);
         }
-        view.set_partial(self.asm.partial_line());
+        view.set_partial(&self.asm.partial_line());
     }
 }
 

@@ -3,6 +3,8 @@
 
 //! A scrollback view over styled cells, one `Vec<Cell>` per line.
 
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 use turbo_vision::core::draw::{Cell, DrawBuffer};
 use turbo_vision::core::event::{
     Event, EventType, KB_DOWN, KB_END, KB_HOME, KB_PGDN, KB_PGUP, KB_UP,
@@ -11,6 +13,89 @@ use turbo_vision::core::geometry::Rect;
 use turbo_vision::core::palette::{Attr, TvColor};
 use turbo_vision::terminal::Terminal;
 use turbo_vision::views::view::{View, write_line_to_terminal};
+
+/// A base character immediately followed by U+FE0F (the emoji presentation
+/// selector, VS-16) or U+FE0E (the text presentation selector, VS-15) forms
+/// one *presentation sequence* whose combined width can differ from the
+/// base character's own width in isolation. This is exactly the shape of
+/// plank's tool-call banner glyph (`🛠️` = U+1F6E0 + U+FE0F): the bare
+/// wrench is East-Asian-Width `Neutral` (width 1), but the fully-qualified
+/// emoji sequence the model actually emits is double-width. `unicode_width`
+/// only resolves this at the *string* level (`UnicodeWidthStr`), not per
+/// `char`, so a two-character lookahead is required to catch it — this is
+/// still the crate doing the Unicode-correctness work; nothing here is a
+/// hand-rolled codepoint table.
+const PRESENTATION_SELECTORS: [char; 2] = ['\u{FE0F}', '\u{FE0E}'];
+
+/// Normalizes a naive, one-`Cell`-per-`char` line into one `Cell` per
+/// terminal *column* — the invariant every other method in this module
+/// relies on (row width, the horizontal `left` clip, and `draw`'s column
+/// count).
+///
+/// A double-width character (an emoji, a CJK glyph) keeps its real `char`
+/// in the first cell and gets a filler cell for each additional column,
+/// mirroring `turbo_vision`'s own `DrawBuffer::move_str` convention: the
+/// terminal's cell-diffing flush already knows to skip a `'\0'` when
+/// encoding output, so an invented filler paints as blank if ever exposed
+/// (e.g. a horizontal scroll cutting a wide character in half) rather than
+/// emitting half a glyph. When the second column instead comes from a real
+/// trailing presentation selector, that selector's own character is kept
+/// as the filler — it is a genuine, zero-advance character, not a padding
+/// artifact, so `plain_text` must still hand it back on Save As.
+///
+/// A zero-width character (a combining mark, a selector whose sequence
+/// collapses to width 0) occupies no column and is dropped — again
+/// matching `move_str`, and this module's only way to keep the stored
+/// column count equal to the true rendered width without a codepoint-range
+/// table of our own.
+///
+/// Idempotent: a spacer cell (`ch == '\0'`) already produced by a previous
+/// call passes through unchanged, so re-normalizing already-normalized
+/// cells (e.g. lines rebuilt from `styled_lines()`) is harmless.
+fn normalize_line(cells: &[Cell]) -> Vec<Cell> {
+    let mut out = Vec::with_capacity(cells.len());
+    let mut i = 0;
+    while i < cells.len() {
+        let cell = cells[i];
+        if cell.ch == '\0' {
+            out.push(cell);
+            i += 1;
+            continue;
+        }
+
+        let next = cells.get(i + 1).copied();
+        let selector = next.filter(|n| PRESENTATION_SELECTORS.contains(&n.ch));
+
+        let width = if let Some(sel) = selector {
+            let mut seq = String::with_capacity(cell.ch.len_utf8() + sel.ch.len_utf8());
+            seq.push(cell.ch);
+            seq.push(sel.ch);
+            seq.width()
+        } else {
+            cell.ch.width().unwrap_or(0)
+        };
+
+        if width == 0 {
+            i += if selector.is_some() { 2 } else { 1 };
+            continue;
+        }
+
+        out.push(cell);
+        if let Some(sel) = selector {
+            out.push(sel);
+            for _ in 2..width {
+                out.push(Cell::new('\0', cell.attr));
+            }
+            i += 2;
+        } else {
+            for _ in 1..width {
+                out.push(Cell::new('\0', cell.attr));
+            }
+            i += 1;
+        }
+    }
+    out
+}
 
 /// Default scrollback depth.
 pub const DEFAULT_MAX_LINES: usize = 10_000;
@@ -55,8 +140,8 @@ impl StreamView {
     }
 
     /// Appends a completed line.
-    pub fn push_line(&mut self, cells: Vec<Cell>) {
-        self.lines.push(cells);
+    pub fn push_line(&mut self, cells: &[Cell]) {
+        self.lines.push(normalize_line(cells));
         self.trim();
         if self.follow {
             self.scroll_to_bottom();
@@ -65,7 +150,8 @@ impl StreamView {
 
     /// Replaces the in-progress line. Called on every repaint while a line is
     /// still streaming, so it must overwrite rather than append.
-    pub fn set_partial(&mut self, cells: Vec<Cell>) {
+    pub fn set_partial(&mut self, cells: &[Cell]) {
+        let cells = normalize_line(cells);
         self.partial = if cells.is_empty() { None } else { Some(cells) };
         if self.follow {
             self.scroll_to_bottom();
@@ -128,7 +214,10 @@ impl StreamView {
             if i > 0 {
                 out.push('\n');
             }
-            out.extend(line.iter().map(|c| c.ch));
+            // Spacer cells (the second column of a wide char) carry no
+            // text of their own; skip them so the saved text round-trips
+            // the original characters with no padding artifacts.
+            out.extend(line.iter().map(|c| c.ch).filter(|&ch| ch != '\0'));
         }
         out
     }
@@ -292,7 +381,7 @@ mod tests {
         let mut v = view();
         v.set_max_lines(3);
         for i in 0..5 {
-            v.push_line(line(&i.to_string()));
+            v.push_line(&line(&i.to_string()));
         }
         assert_eq!(v.line_count(), 3);
         assert_eq!(v.plain_text(), "2\n3\n4");
@@ -302,7 +391,7 @@ mod tests {
     fn autoscroll_holds_at_bottom_while_lines_arrive() {
         let mut v = view();
         for i in 0..50 {
-            v.push_line(line(&i.to_string()));
+            v.push_line(&line(&i.to_string()));
         }
         assert!(v.is_at_bottom());
     }
@@ -311,11 +400,11 @@ mod tests {
     fn scrolling_up_releases_autoscroll_and_end_rearms_it() {
         let mut v = view();
         for i in 0..50 {
-            v.push_line(line(&i.to_string()));
+            v.push_line(&line(&i.to_string()));
         }
         v.scroll_up(5);
         assert!(!v.is_at_bottom());
-        v.push_line(line("new"));
+        v.push_line(&line("new"));
         assert!(
             !v.is_at_bottom(),
             "a new line must not yank a scrolled-back reader to the bottom"
@@ -327,8 +416,8 @@ mod tests {
     #[test]
     fn partial_line_is_replaced_not_appended() {
         let mut v = view();
-        v.set_partial(line("par"));
-        v.set_partial(line("part"));
+        v.set_partial(&line("par"));
+        v.set_partial(&line("part"));
         assert_eq!(v.plain_text(), "part");
         assert_eq!(v.line_count(), 1);
     }
@@ -336,10 +425,7 @@ mod tests {
     #[test]
     fn plain_text_strips_attributes() {
         let mut v = view();
-        v.push_line(vec![Cell::new(
-            'x',
-            Attr::new(TvColor::LightRed, TvColor::Blue),
-        )]);
+        v.push_line(&[Cell::new('x', Attr::new(TvColor::LightRed, TvColor::Blue))]);
         assert_eq!(v.plain_text(), "x");
     }
 
@@ -347,7 +433,7 @@ mod tests {
     fn resize_larger_while_scrolled_back_reclamps_top_to_show_a_full_page() {
         let mut v = StreamView::new(Rect::new(0, 0, 40, 5));
         for i in 0..50 {
-            v.push_line(line(&i.to_string()));
+            v.push_line(&line(&i.to_string()));
         }
         // Scroll back so `top` sits well below the current max_top()
         // (line_count 50, page 5 -> max_top 45).
@@ -380,8 +466,8 @@ mod tests {
     #[test]
     fn draw_clips_to_bounds_and_applies_horizontal_offset() {
         let mut v = StreamView::new(Rect::new(2, 1, 8, 4));
-        v.push_line(line("abcdefghij")); // longer than the 6-wide view
-        v.push_line(line("short")); // shorter than the 6-wide view
+        v.push_line(&line("abcdefghij")); // longer than the 6-wide view
+        v.push_line(&line("short")); // shorter than the 6-wide view
         v.left = 2; // horizontal scroll offset
 
         let mut terminal = fake_terminal(20, 10);
@@ -411,10 +497,119 @@ mod tests {
         assert_eq!(terminal.read_cell(2, 0).unwrap().ch, ' ');
     }
 
+    /// The exact banner glyph plank emits: U+1F6E0 HAMMER AND WRENCH followed
+    /// by U+FE0F VARIATION SELECTOR-16 (the emoji presentation selector).
+    /// The base character alone is East-Asian-Width `Neutral` (width 1 per
+    /// `unicode-width`'s plain per-`char` rule) -- it is only the
+    /// *emoji presentation sequence* (base + U+FE0F) that is double-width,
+    /// which is exactly the sequence a real tool-call banner sends and the
+    /// case this fix targets. `line()` builds one `Cell` per `char` here
+    /// too, since `.chars()` splits the base and the selector into two
+    /// separate `char`s -- the same shape `tracefmt`'s `cells()` produces.
+    const WRENCH: &str = "\u{1F6E0}\u{FE0F}";
+
+    #[test]
+    fn wide_character_row_paints_the_correct_total_number_of_columns() {
+        // wrench (2 columns) + space + x = 4 columns total.
+        let mut v = StreamView::new(Rect::new(0, 0, 10, 4));
+        v.push_line(&line(&format!("{WRENCH} x")));
+        let mut terminal = fake_terminal(20, 10);
+        v.draw(&mut terminal);
+
+        // Column 0 holds the wrench glyph itself.
+        assert_eq!(terminal.read_cell(0, 0).unwrap().ch, '\u{1F6E0}');
+        // Column 1 is the wrench's second column: the trailing presentation
+        // selector itself, kept (not an invented '\0') because it is a real
+        // character.
+        assert_eq!(terminal.read_cell(1, 0).unwrap().ch, '\u{FE0F}');
+        // The rest of the row lands at its true, width-aware columns.
+        assert_eq!(terminal.read_cell(2, 0).unwrap().ch, ' ');
+        assert_eq!(terminal.read_cell(3, 0).unwrap().ch, 'x');
+        // And the row is blank-padded for the remaining columns of the view.
+        for x in 4..10 {
+            assert_eq!(terminal.read_cell(x, 0).unwrap().ch, ' ');
+        }
+    }
+
+    #[test]
+    fn text_after_a_wide_character_lands_at_the_right_column() {
+        let mut v = StreamView::new(Rect::new(0, 0, 30, 4));
+        v.push_line(&line(&format!("{WRENCH} Reading src/dsml.rs")));
+        let mut terminal = fake_terminal(30, 10);
+        v.draw(&mut terminal);
+
+        let expected = "\u{1F6E0}\u{FE0F} Reading src/dsml.rs";
+        for (i, expected_ch) in expected.chars().enumerate() {
+            let cell = terminal
+                .read_cell(i16::try_from(i).unwrap(), 0)
+                .expect("cell within terminal bounds");
+            assert_eq!(cell.ch, expected_ch, "column {i} mismatch");
+        }
+    }
+
+    #[test]
+    fn short_row_is_blank_padded_so_nothing_shows_through_from_beneath() {
+        let mut v = StreamView::new(Rect::new(0, 0, 10, 4));
+        // First paint a row that fills the whole width...
+        v.push_line(&line("XXXXXXXXXX"));
+        let mut terminal = fake_terminal(20, 10);
+        v.draw(&mut terminal);
+        // ...then a shorter, width-shrinking row should overwrite every
+        // column the first row touched, leaving nothing behind.
+        v.clear();
+        v.push_line(&line(&format!("{WRENCH}hi")));
+        v.draw(&mut terminal);
+
+        assert_eq!(terminal.read_cell(0, 0).unwrap().ch, '\u{1F6E0}');
+        assert_eq!(terminal.read_cell(1, 0).unwrap().ch, '\u{FE0F}');
+        assert_eq!(terminal.read_cell(2, 0).unwrap().ch, 'h');
+        assert_eq!(terminal.read_cell(3, 0).unwrap().ch, 'i');
+        for x in 4..10 {
+            assert_eq!(
+                terminal.read_cell(x, 0).unwrap().ch,
+                ' ',
+                "column {x} must be blanked, not left over from the previous row"
+            );
+        }
+    }
+
+    #[test]
+    fn horizontal_offset_clips_correctly_when_a_wide_character_straddles_the_cut() {
+        let mut v = StreamView::new(Rect::new(0, 0, 6, 4));
+        v.push_line(&line(&format!("ab{WRENCH}cd"))); // columns: a b [wrench] [spacer] c d
+        v.left = 2; // skip "ab", landing on the wrench's first column
+        let mut terminal = fake_terminal(20, 10);
+        v.draw(&mut terminal);
+
+        assert_eq!(terminal.read_cell(0, 0).unwrap().ch, '\u{1F6E0}');
+        assert_eq!(terminal.read_cell(1, 0).unwrap().ch, '\u{FE0F}');
+        assert_eq!(terminal.read_cell(2, 0).unwrap().ch, 'c');
+        assert_eq!(terminal.read_cell(3, 0).unwrap().ch, 'd');
+
+        // Now offset by 3, landing squarely on the spacer half of the
+        // wrench: only the lone selector character (zero-advance-width in
+        // any real terminal, so it paints as blank on its own) shows at
+        // column 0, never half a glyph, and everything after it must still
+        // be at its true column.
+        v.left = 3;
+        let mut terminal2 = fake_terminal(20, 10);
+        v.draw(&mut terminal2);
+        assert_eq!(terminal2.read_cell(0, 0).unwrap().ch, '\u{FE0F}');
+        assert_eq!(terminal2.read_cell(1, 0).unwrap().ch, 'c');
+        assert_eq!(terminal2.read_cell(2, 0).unwrap().ch, 'd');
+    }
+
+    #[test]
+    fn plain_text_round_trips_a_wide_character_with_no_padding_artifacts() {
+        let mut v = view();
+        v.push_line(&line(&format!("{WRENCH} Reading src/dsml.rs")));
+        assert_eq!(v.plain_text(), format!("{WRENCH} Reading src/dsml.rs"));
+    }
+
     #[test]
     fn draw_on_zero_height_view_writes_nothing() {
         let mut v = StreamView::new(Rect::new(0, 0, 10, 0));
-        v.push_line(line("hello"));
+        v.push_line(&line("hello"));
         let mut terminal = fake_terminal(20, 10);
         v.draw(&mut terminal);
         for y in 0..10 {

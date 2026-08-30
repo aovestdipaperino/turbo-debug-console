@@ -165,9 +165,9 @@ impl TraceRenderer {
         while let Some(pos) = self.carry.iter().position(|&b| b == b'\n') {
             let line_bytes: Vec<u8> = self.carry.drain(..=pos).collect();
             let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]);
-            view.push_line(render_line(&line));
+            view.push_line(&render_line(&line));
         }
-        view.set_partial(render_line(&String::from_utf8_lossy(&self.carry)));
+        view.set_partial(&render_line(&String::from_utf8_lossy(&self.carry)));
     }
 
     /// Ends the stream: flushes any trailing partial line as a completed one.
@@ -175,9 +175,9 @@ impl TraceRenderer {
         if !self.carry.is_empty() {
             let line = String::from_utf8_lossy(&self.carry).into_owned();
             self.carry.clear();
-            view.push_line(render_line(&line));
+            view.push_line(&render_line(&line));
         }
-        view.set_partial(Vec::new());
+        view.set_partial(&[]);
     }
 }
 
