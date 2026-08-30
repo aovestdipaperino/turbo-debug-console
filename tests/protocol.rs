@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
+use turbo_debug_console::proto::StreamKind;
 use turbo_debug_console::registry::{Server, ServerEvent};
 
 /// Sends a handshake to the control port and returns the reply line.
@@ -34,7 +35,7 @@ fn wait_for<T>(server: &Server, mut f: impl FnMut(&ServerEvent) -> Option<T>) ->
 #[test]
 fn hello_allocates_a_data_port_and_opens_a_session() {
     let server = Server::bind(0).unwrap();
-    let reply = hello(server.control_port(), "HELLO 1 alpha");
+    let reply = hello(server.control_port(), "HELLO 1 tokens alpha");
     let port: u16 = reply.strip_prefix("PORT ").unwrap().parse().unwrap();
     assert_ne!(port, server.control_port());
 
@@ -58,7 +59,7 @@ fn hello_allocates_a_data_port_and_opens_a_session() {
 #[test]
 fn the_same_name_returns_the_same_port_and_reconnects() {
     let server = Server::bind(0).unwrap();
-    let first = hello(server.control_port(), "HELLO 1 beta");
+    let first = hello(server.control_port(), "HELLO 1 tokens beta");
     let port: u16 = first.strip_prefix("PORT ").unwrap().parse().unwrap();
     let mut data = TcpStream::connect(("127.0.0.1", port)).unwrap();
     data.write_all(b"a").unwrap();
@@ -67,7 +68,7 @@ fn the_same_name_returns_the_same_port_and_reconnects() {
         matches!(ev, ServerEvent::Disconnected { .. }).then_some(())
     });
 
-    let second = hello(server.control_port(), "HELLO 1 beta");
+    let second = hello(server.control_port(), "HELLO 1 tokens beta");
     assert_eq!(first, second, "a known name must keep its port");
 
     // `Attached` is the sole source of truth for "connected" (defect 1),
@@ -92,7 +93,7 @@ fn the_same_name_returns_the_same_port_and_reconnects() {
 #[test]
 fn the_ordinary_first_attach_reports_attached_not_reattached() {
     let server = Server::bind(0).unwrap();
-    let reply = hello(server.control_port(), "HELLO 1 first-timer");
+    let reply = hello(server.control_port(), "HELLO 1 tokens first-timer");
     let port: u16 = reply.strip_prefix("PORT ").unwrap().parse().unwrap();
 
     let mut data = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -111,7 +112,7 @@ fn the_ordinary_first_attach_reports_attached_not_reattached() {
 #[test]
 fn a_dropped_data_socket_leaves_the_session_listening() {
     let server = Server::bind(0).unwrap();
-    let reply = hello(server.control_port(), "HELLO 1 gamma");
+    let reply = hello(server.control_port(), "HELLO 1 tokens gamma");
     let port: u16 = reply.strip_prefix("PORT ").unwrap().parse().unwrap();
 
     let data = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -132,7 +133,7 @@ fn a_dropped_data_socket_leaves_the_session_listening() {
 #[test]
 fn a_second_live_writer_is_refused() {
     let server = Server::bind(0).unwrap();
-    let reply = hello(server.control_port(), "HELLO 1 delta");
+    let reply = hello(server.control_port(), "HELLO 1 tokens delta");
     let port: u16 = reply.strip_prefix("PORT ").unwrap().parse().unwrap();
 
     let mut first = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -156,21 +157,24 @@ fn a_second_live_writer_is_refused() {
 #[test]
 fn bad_names_are_refused_and_the_server_stays_up() {
     let server = Server::bind(0).unwrap();
-    assert_eq!(hello(server.control_port(), "HELLO 1 "), "ERR bad name");
+    assert_eq!(
+        hello(server.control_port(), "HELLO 1 tokens "),
+        "ERR bad name"
+    );
     assert_eq!(
         hello(
             server.control_port(),
-            &format!("HELLO 1 {}", "x".repeat(65))
+            &format!("HELLO 1 tokens {}", "x".repeat(65))
         ),
         "ERR bad name"
     );
-    assert!(hello(server.control_port(), "HELLO 1 ok").starts_with("PORT "));
+    assert!(hello(server.control_port(), "HELLO 1 tokens ok").starts_with("PORT "));
 }
 
 #[test]
 fn a_good_versioned_handshake_is_accepted() {
     let server = Server::bind(0).unwrap();
-    assert!(hello(server.control_port(), "HELLO 1 versioned").starts_with("PORT "));
+    assert!(hello(server.control_port(), "HELLO 1 tokens versioned").starts_with("PORT "));
 }
 
 #[test]
@@ -241,7 +245,7 @@ fn a_non_hello_first_line_becomes_an_anonymous_session() {
 #[test]
 fn a_reconnect_clears_idle_since_so_the_session_never_reaps_while_reused() {
     let mut server = Server::bind(0).unwrap();
-    let reply = hello(server.control_port(), "HELLO 1 epsilon");
+    let reply = hello(server.control_port(), "HELLO 1 tokens epsilon");
     let port: u16 = reply.strip_prefix("PORT ").unwrap().parse().unwrap();
 
     // Attach and detach once so idle_since gets set.
@@ -256,7 +260,7 @@ fn a_reconnect_clears_idle_since_so_the_session_never_reaps_while_reused() {
     // bookkeeping now — no event is sent for a HELLO reconnect by itself,
     // since `Attached` (sent only once a data socket actually attaches) is
     // the sole source of truth for the UI's "connected" state.
-    let second = hello(server.control_port(), "HELLO 1 epsilon");
+    let second = hello(server.control_port(), "HELLO 1 tokens epsilon");
     assert_eq!(reply, second);
 
     // A zero-duration TTL would reap anything with idle_since still set;
@@ -288,7 +292,7 @@ fn a_reconnect_clears_idle_since_so_the_session_never_reaps_while_reused() {
 #[test]
 fn reaping_sends_closed_and_releases_the_session_listener_port() {
     let mut server = Server::bind(0).unwrap();
-    let reply = hello(server.control_port(), "HELLO 1 zeta");
+    let reply = hello(server.control_port(), "HELLO 1 tokens zeta");
     let port: u16 = reply.strip_prefix("PORT ").unwrap().parse().unwrap();
 
     // Never attach a data socket; idle_since was set the instant the
@@ -330,7 +334,7 @@ fn reaping_sends_closed_and_releases_the_session_listener_port() {
 #[test]
 fn close_session_releases_the_port_even_though_the_session_is_still_live() {
     let mut server = Server::bind(0).unwrap();
-    let reply = hello(server.control_port(), "HELLO 1 closed-window");
+    let reply = hello(server.control_port(), "HELLO 1 tokens closed-window");
     let port: u16 = reply.strip_prefix("PORT ").unwrap().parse().unwrap();
 
     // `wait_for` drains events looking for a match and discards anything
@@ -377,7 +381,7 @@ fn close_session_releases_the_port_even_though_the_session_is_still_live() {
 
     // A fresh HELLO for the same name must be treated as brand new (a new
     // port, a new session) rather than reusing the torn-down one.
-    let reopened = hello(server.control_port(), "HELLO 1 closed-window");
+    let reopened = hello(server.control_port(), "HELLO 1 tokens closed-window");
     let reopened_port: u16 = reopened.strip_prefix("PORT ").unwrap().parse().unwrap();
     assert_ne!(
         reopened_port, port,
@@ -398,7 +402,7 @@ fn close_session_releases_the_port_even_though_the_session_is_still_live() {
 #[test]
 fn close_then_immediate_redial_ends_up_attached_with_one_writer_and_no_spurious_disconnect() {
     let server = Server::bind(0).unwrap();
-    let reply = hello(server.control_port(), "HELLO 1 race");
+    let reply = hello(server.control_port(), "HELLO 1 tokens race");
     let port: u16 = reply.strip_prefix("PORT ").unwrap().parse().unwrap();
     // Captured once: `wait_for` drains and discards non-matching events, so
     // this must happen before any other `wait_for` call in the loop below
@@ -542,4 +546,65 @@ fn an_anonymous_session_becomes_reapable_after_its_connection_ends() {
         _ => None,
     });
     assert_eq!(closed_id, id);
+}
+
+#[test]
+fn a_trace_hello_opens_a_session_with_the_trace_kind() {
+    let server = Server::bind(0).unwrap();
+    let reply = hello(server.control_port(), "HELLO 1 trace myapp");
+    assert!(reply.starts_with("PORT "));
+
+    let kind = wait_for(&server, |ev| match ev {
+        ServerEvent::Opened { kind, .. } => Some(*kind),
+        _ => None,
+    });
+    assert_eq!(kind, StreamKind::Trace);
+}
+
+#[test]
+fn a_tokens_hello_opens_a_session_with_the_tokens_kind() {
+    let server = Server::bind(0).unwrap();
+    hello(server.control_port(), "HELLO 1 tokens build");
+
+    let kind = wait_for(&server, |ev| match ev {
+        ServerEvent::Opened { kind, .. } => Some(*kind),
+        _ => None,
+    });
+    assert_eq!(kind, StreamKind::Tokens);
+}
+
+#[test]
+fn an_unknown_stream_kind_is_refused_with_its_name() {
+    let server = Server::bind(0).unwrap();
+    assert_eq!(
+        hello(server.control_port(), "HELLO 1 bogus myapp"),
+        "ERR unknown stream kind bogus"
+    );
+}
+
+/// The old two-field `HELLO <version> <name>` form is a distinct, honest
+/// error rather than silently defaulting to `tokens` -- see `proto.rs`.
+#[test]
+fn the_old_two_field_hello_form_is_a_hard_error() {
+    let server = Server::bind(0).unwrap();
+    assert_eq!(
+        hello(server.control_port(), "HELLO 1 build-agent"),
+        "ERR missing stream kind"
+    );
+}
+
+/// The anonymous fallback (a first line that is not a `HELLO` at all) must
+/// still default to the `tokens` kind, so `cat capture.txt | nc ...` keeps
+/// working with no ceremony.
+#[test]
+fn the_anonymous_fallback_defaults_to_the_tokens_kind() {
+    let server = Server::bind(0).unwrap();
+    let mut s = TcpStream::connect(("127.0.0.1", server.control_port())).unwrap();
+    s.write_all(b"just a raw capture\n").unwrap();
+
+    let kind = wait_for(&server, |ev| match ev {
+        ServerEvent::Opened { kind, .. } => Some(*kind),
+        _ => None,
+    });
+    assert_eq!(kind, StreamKind::Tokens);
 }

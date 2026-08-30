@@ -22,6 +22,7 @@ path = "src/main.rs"
 [dependencies]
 trace-stream = "0.1"
 turbo-vision = "2.0"
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [lints.rust]
 missing_debug_implementations = "warn"

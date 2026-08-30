@@ -14,8 +14,10 @@ use turbo_vision::terminal::Terminal;
 use turbo_vision::views::view::View;
 
 use crate::pipeline::Pipeline;
+use crate::proto::StreamKind;
 use crate::registry::SessionId;
 use crate::streamview::StreamView;
+use crate::tracefmt::TraceRenderer;
 
 /// A `StreamView` addressable from both the desktop and the event pump.
 pub type SharedView = Rc<RefCell<StreamView>>;
@@ -45,26 +47,73 @@ impl View for SharedStreamView {
     }
 }
 
+/// A session's renderer: which one it holds depends on its [`StreamKind`].
+/// A trace session has no [`Pipeline`] -- that pipeline is the markdown/DSML
+/// renderer for model token streams, the wrong tool for a structured log
+/// line, so none is ever constructed for one.
+#[derive(Debug)]
+enum Renderer {
+    Tokens(Box<Pipeline>),
+    Trace(TraceRenderer),
+}
+
+impl Renderer {
+    fn feed(&mut self, bytes: &[u8], view: &mut StreamView) {
+        match self {
+            Self::Tokens(p) => p.feed(bytes, view),
+            Self::Trace(t) => t.feed(bytes, view),
+        }
+    }
+
+    fn finish(&mut self, view: &mut StreamView) {
+        match self {
+            Self::Tokens(p) => p.finish(view),
+            Self::Trace(t) => t.finish(view),
+        }
+    }
+}
+
 /// Per-session state owned by the main loop.
 #[derive(Debug)]
 pub struct SessionState {
     pub name: String,
     pub port: u16,
     pub view: SharedView,
-    pub pipeline: Pipeline,
+    pub kind: StreamKind,
+    renderer: Renderer,
     pub connected: bool,
 }
 
 impl SessionState {
-    /// Title text for this session's window.
+    /// Title text for this session's window. A trace session's kind is
+    /// called out with a leading `[trace]` tag -- the `name :port` shape
+    /// alone gives no hint that a window is rendering structured log
+    /// records rather than a token stream, and that distinction matters
+    /// enough at a glance to be worth the few extra characters.
     #[must_use]
     pub fn window_title(&self) -> String {
         let base = format_title(&self.name, self.port);
+        let base = match self.kind {
+            StreamKind::Tokens => base,
+            StreamKind::Trace => format!("[trace] {base}"),
+        };
         if self.connected {
             base
         } else {
             format!("{base} [disconnected]")
         }
+    }
+
+    /// Pushes stream bytes through this session's renderer and into its view.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        let mut view = self.view.borrow_mut();
+        self.renderer.feed(bytes, &mut view);
+    }
+
+    /// Ends the stream: flushes the renderer and any trailing partial line.
+    pub fn finish(&mut self) {
+        let mut view = self.view.borrow_mut();
+        self.renderer.finish(&mut view);
     }
 }
 
@@ -94,16 +143,22 @@ impl Sessions {
         id: SessionId,
         name: String,
         port: u16,
+        kind: StreamKind,
         view: SharedView,
         opts: RenderOptions,
     ) {
+        let renderer = match kind {
+            StreamKind::Tokens => Renderer::Tokens(Box::new(Pipeline::new(opts))),
+            StreamKind::Trace => Renderer::Trace(TraceRenderer::new()),
+        };
         self.inner.insert(
             id,
             SessionState {
                 name,
                 port,
                 view,
-                pipeline: Pipeline::new(opts),
+                kind,
+                renderer,
                 connected: false,
             },
         );
@@ -117,11 +172,10 @@ impl Sessions {
         self.inner.remove(&id)
     }
 
-    /// Feeds bytes into a session's pipeline and view.
+    /// Feeds bytes into a session's renderer and view.
     pub fn feed(&mut self, id: SessionId, data: &[u8]) {
         if let Some(s) = self.inner.get_mut(&id) {
-            let mut view = s.view.borrow_mut();
-            s.pipeline.feed(data, &mut view);
+            s.feed(data);
         }
     }
 
@@ -129,8 +183,7 @@ impl Sessions {
     pub fn mark_reconnected(&mut self, id: SessionId) {
         if let Some(s) = self.inner.get_mut(&id) {
             s.connected = true;
-            let mut view = s.view.borrow_mut();
-            s.pipeline.feed(b"\n-- reconnected --\n", &mut view);
+            s.feed(b"\n-- reconnected --\n");
         }
     }
 
@@ -150,8 +203,7 @@ impl Sessions {
     pub fn mark_disconnected(&mut self, id: SessionId) {
         if let Some(s) = self.inner.get_mut(&id) {
             s.connected = false;
-            let mut view = s.view.borrow_mut();
-            s.pipeline.finish(&mut view);
+            s.finish();
         }
     }
 
@@ -197,7 +249,7 @@ mod tests {
     #[test]
     fn feed_reaches_the_session_view() {
         let mut sessions = Sessions::default();
-        sessions.insert(1, "demo".into(), 4242, view(), opts());
+        sessions.insert(1, "demo".into(), 4242, StreamKind::Tokens, view(), opts());
         sessions.feed(1, b"hello\n");
         assert!(sessions.plain_text(1).unwrap().contains("hello"));
     }
@@ -205,7 +257,7 @@ mod tests {
     #[test]
     fn window_title_reflects_connection_state() {
         let mut sessions = Sessions::default();
-        sessions.insert(1, "demo".into(), 4242, view(), opts());
+        sessions.insert(1, "demo".into(), 4242, StreamKind::Tokens, view(), opts());
         assert_eq!(
             sessions.window_title(1).unwrap(),
             "demo :4242 [disconnected]"
@@ -222,7 +274,7 @@ mod tests {
     #[test]
     fn window_title_omits_a_zero_port() {
         let mut sessions = Sessions::default();
-        sessions.insert(1, "anon-1".into(), 0, view(), opts());
+        sessions.insert(1, "anon-1".into(), 0, StreamKind::Tokens, view(), opts());
         assert_eq!(sessions.window_title(1).unwrap(), "anon-1 [disconnected]");
         sessions.mark_reconnected(1);
         assert_eq!(sessions.window_title(1).unwrap(), "anon-1");
@@ -236,7 +288,7 @@ mod tests {
     #[test]
     fn mark_attached_first_attach_connects_without_a_rule() {
         let mut sessions = Sessions::default();
-        sessions.insert(1, "demo".into(), 4242, view(), opts());
+        sessions.insert(1, "demo".into(), 4242, StreamKind::Tokens, view(), opts());
         sessions.mark_attached(1, false);
         assert_eq!(sessions.window_title(1).unwrap(), "demo :4242");
         assert!(!sessions.plain_text(1).unwrap().contains("reconnected"));
@@ -247,7 +299,7 @@ mod tests {
     #[test]
     fn mark_attached_reattach_connects_and_draws_a_rule() {
         let mut sessions = Sessions::default();
-        sessions.insert(1, "demo".into(), 4242, view(), opts());
+        sessions.insert(1, "demo".into(), 4242, StreamKind::Tokens, view(), opts());
         sessions.mark_attached(1, true);
         assert_eq!(sessions.window_title(1).unwrap(), "demo :4242");
         assert!(sessions.plain_text(1).unwrap().contains("reconnected"));
@@ -256,7 +308,7 @@ mod tests {
     #[test]
     fn mark_reconnected_draws_a_horizontal_rule() {
         let mut sessions = Sessions::default();
-        sessions.insert(1, "demo".into(), 4242, view(), opts());
+        sessions.insert(1, "demo".into(), 4242, StreamKind::Tokens, view(), opts());
         sessions.mark_reconnected(1);
         assert!(sessions.plain_text(1).unwrap().contains("reconnected"));
     }
@@ -264,7 +316,7 @@ mod tests {
     #[test]
     fn clear_empties_the_scrollback() {
         let mut sessions = Sessions::default();
-        sessions.insert(1, "demo".into(), 4242, view(), opts());
+        sessions.insert(1, "demo".into(), 4242, StreamKind::Tokens, view(), opts());
         sessions.feed(1, b"hello\n");
         sessions.clear(1);
         assert_eq!(sessions.plain_text(1).unwrap(), "");
@@ -273,7 +325,7 @@ mod tests {
     #[test]
     fn remove_drops_the_session() {
         let mut sessions = Sessions::default();
-        sessions.insert(1, "demo".into(), 4242, view(), opts());
+        sessions.insert(1, "demo".into(), 4242, StreamKind::Tokens, view(), opts());
         assert!(sessions.remove(1).is_some());
         assert!(sessions.plain_text(1).is_none());
     }
@@ -283,5 +335,25 @@ mod tests {
         let sessions = Sessions::default();
         assert!(sessions.plain_text(99).is_none());
         assert!(sessions.window_title(99).is_none());
+    }
+
+    #[test]
+    fn a_trace_session_renders_through_tracefmt_not_the_pipeline() {
+        let mut sessions = Sessions::default();
+        sessions.insert(1, "myapp".into(), 4242, StreamKind::Trace, view(), opts());
+        sessions.feed(1, b"{\"level\":\"INFO\",\"fields\":{\"message\":\"hi\"}}\n");
+        assert_eq!(sessions.plain_text(1).unwrap(), "INFO  hi");
+    }
+
+    #[test]
+    fn a_trace_session_window_title_is_tagged() {
+        let mut sessions = Sessions::default();
+        sessions.insert(1, "myapp".into(), 4242, StreamKind::Trace, view(), opts());
+        assert_eq!(
+            sessions.window_title(1).unwrap(),
+            "[trace] myapp :4242 [disconnected]"
+        );
+        sessions.mark_reconnected(1);
+        assert_eq!(sessions.window_title(1).unwrap(), "[trace] myapp :4242");
     }
 }

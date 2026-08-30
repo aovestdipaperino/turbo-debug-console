@@ -21,7 +21,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::proto::{HelloError, parse_hello};
+use crate::proto::{HelloError, StreamKind, parse_hello};
 
 /// How long the handshake line may take to arrive.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -39,6 +39,7 @@ pub enum ServerEvent {
         id: SessionId,
         name: String,
         port: u16,
+        kind: StreamKind,
     },
     /// A data socket just attached to a session (`live` flipped false ->
     /// true). Fires for the ordinary first attach of a brand-new session
@@ -331,7 +332,7 @@ fn handle_control(
     }
 
     match parse_hello(&line) {
-        Ok(name) => match open_or_reuse(&name, sessions, tx) {
+        Ok((kind, name)) => match open_or_reuse(&name, kind, sessions, tx) {
             Ok(port) => {
                 let _ = writeln!(writer, "PORT {port}");
             }
@@ -343,7 +344,9 @@ fn handle_control(
             e @ (HelloError::BadName
             | HelloError::MissingVersion
             | HelloError::BadVersion
-            | HelloError::UnsupportedVersion(_)),
+            | HelloError::UnsupportedVersion(_)
+            | HelloError::MissingStreamKind
+            | HelloError::UnknownStreamKind(_)),
         ) => {
             let _ = writeln!(writer, "{}", e.wire());
         }
@@ -371,6 +374,7 @@ fn handle_control(
                 id,
                 name: name.clone(),
                 port: 0,
+                kind: StreamKind::Tokens,
             });
             let _ = tx.send(ServerEvent::Attached {
                 id,
@@ -399,6 +403,7 @@ fn handle_control(
 /// Returns the data port for `name`, creating the session if it is new.
 fn open_or_reuse(
     name: &str,
+    kind: StreamKind,
     sessions: &Arc<Mutex<HashMap<String, Session>>>,
     tx: &Sender<ServerEvent>,
 ) -> std::io::Result<u16> {
@@ -438,6 +443,7 @@ fn open_or_reuse(
         id,
         name: name.to_string(),
         port,
+        kind,
     });
 
     let tx = tx.clone();

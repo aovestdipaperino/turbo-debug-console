@@ -11,3 +11,4 @@ pub mod proto;
 pub mod registry;
 pub mod session;
 pub mod streamview;
+pub mod tracefmt;

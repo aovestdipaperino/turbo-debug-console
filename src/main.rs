@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use trace_stream::render::RenderOptions;
 use turbo_debug_console::cmd;
-use turbo_debug_console::proto::PROTOCOL_VERSION;
+use turbo_debug_console::proto::{PROTOCOL_VERSION, StreamKind};
 use turbo_debug_console::registry::{Server, ServerEvent, SessionId};
 use turbo_debug_console::session::{Sessions, SharedStreamView, format_title};
 use turbo_debug_console::streamview::StreamView;
@@ -73,10 +73,14 @@ fn handle_cli_flags() {
                      Takes no options: it listens on the fixed control port {CONTROL_PORT}.\n\
                      \n\
                      Name a session and get a port to stream at:\n\
-                     \n    printf 'HELLO {PROTOCOL_VERSION} build\\n' | nc 127.0.0.1 {CONTROL_PORT}\n\
+                     \n    printf 'HELLO {PROTOCOL_VERSION} tokens build\\n' | nc 127.0.0.1 {CONTROL_PORT}\n\
+                     \n\
+                     <kind> is 'tokens' (a model token stream) or 'trace' (JSON-lines\n\
+                     tracing-subscriber records):\n\
+                     \n    printf 'HELLO {PROTOCOL_VERSION} trace myapp\\n' | nc 127.0.0.1 {CONTROL_PORT}\n\
                      \n\
                      Or skip the handshake -- anything that is not a HELLO is\n\
-                     rendered as a raw stream in its own window:\n\
+                     rendered as a raw token stream in its own window:\n\
                      \n    cat capture.txt | nc 127.0.0.1 {CONTROL_PORT}\n\
                      \n\
                      KEYS\n    \
@@ -201,6 +205,7 @@ enum ConsoleIntent {
         id: SessionId,
         name: String,
         port: u16,
+        kind: StreamKind,
     },
     Retitle {
         view_id: ViewId,
@@ -254,9 +259,17 @@ impl Console {
     /// unit-testable without a TTY.
     fn decide_server_event(&mut self, ev: ServerEvent) -> Option<ConsoleIntent> {
         match ev {
-            ServerEvent::Opened { id, name, port } => {
-                Some(ConsoleIntent::CreateWindow { id, name, port })
-            }
+            ServerEvent::Opened {
+                id,
+                name,
+                port,
+                kind,
+            } => Some(ConsoleIntent::CreateWindow {
+                id,
+                name,
+                port,
+                kind,
+            }),
             ServerEvent::Attached { id, reattached } => {
                 self.sessions.mark_attached(id, reattached);
                 self.retitle_intent(id)
@@ -298,16 +311,31 @@ impl Console {
     /// calls for.
     fn apply_intent(&mut self, app: &mut Application, intent: ConsoleIntent) {
         match intent {
-            ConsoleIntent::CreateWindow { id, name, port } => {
+            ConsoleIntent::CreateWindow {
+                id,
+                name,
+                port,
+                kind,
+            } => {
                 let window_bounds = tile_window_bounds(app);
                 let view = Rc::new(RefCell::new(StreamView::new(session_view_bounds(
                     window_bounds,
                 ))));
-                self.sessions
-                    .insert(id, name.clone(), port, Rc::clone(&view), RENDER_OPTIONS);
+                self.sessions.insert(
+                    id,
+                    name.clone(),
+                    port,
+                    kind,
+                    Rc::clone(&view),
+                    RENDER_OPTIONS,
+                );
+                let title = match kind {
+                    StreamKind::Tokens => format_title(&name, port),
+                    StreamKind::Trace => format!("[trace] {}", format_title(&name, port)),
+                };
                 let mut window = WindowBuilder::new()
                     .bounds(window_bounds)
-                    .title(format_title(&name, port))
+                    .title(title)
                     .build();
                 apply_session_window_palette(&mut window);
                 window.add(Box::new(SharedStreamView(view)));
@@ -407,12 +435,18 @@ impl Console {
         ))));
         let id = NEXT_CAPTURE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        self.sessions
-            .insert(id, name.clone(), 0, Rc::clone(&view), RENDER_OPTIONS);
+        self.sessions.insert(
+            id,
+            name.clone(),
+            0,
+            StreamKind::Tokens,
+            Rc::clone(&view),
+            RENDER_OPTIONS,
+        );
         if let Some(state) = self.sessions.get_mut(id) {
             state.connected = true;
-            state.pipeline.feed(&bytes, &mut view.borrow_mut());
-            state.pipeline.finish(&mut view.borrow_mut());
+            state.feed(&bytes);
+            state.finish();
         }
 
         let mut window = WindowBuilder::new()
@@ -567,6 +601,7 @@ mod console_decision_tests {
             id: 1,
             name: "demo".into(),
             port: 61278,
+            kind: StreamKind::Tokens,
         });
         assert_eq!(
             intent,
@@ -574,6 +609,27 @@ mod console_decision_tests {
                 id: 1,
                 name: "demo".into(),
                 port: 61278,
+                kind: StreamKind::Tokens,
+            })
+        );
+    }
+
+    #[test]
+    fn opened_carries_the_trace_kind_through() {
+        let mut console = Console::default();
+        let intent = console.decide_server_event(ServerEvent::Opened {
+            id: 1,
+            name: "myapp".into(),
+            port: 61279,
+            kind: StreamKind::Trace,
+        });
+        assert_eq!(
+            intent,
+            Some(ConsoleIntent::CreateWindow {
+                id: 1,
+                name: "myapp".into(),
+                port: 61279,
+                kind: StreamKind::Trace,
             })
         );
     }
@@ -581,9 +637,14 @@ mod console_decision_tests {
     #[test]
     fn bytes_decides_nothing_but_still_feeds_the_session() {
         let mut console = Console::default();
-        console
-            .sessions
-            .insert(1, "demo".into(), 4242, test_view(), RENDER_OPTIONS);
+        console.sessions.insert(
+            1,
+            "demo".into(),
+            4242,
+            StreamKind::Tokens,
+            test_view(),
+            RENDER_OPTIONS,
+        );
         let intent = console.decide_server_event(ServerEvent::Bytes {
             id: 1,
             data: b"hello\n".to_vec(),
@@ -595,9 +656,14 @@ mod console_decision_tests {
     #[test]
     fn attached_reattach_decides_to_retitle_the_mapped_window() {
         let mut console = Console::default();
-        console
-            .sessions
-            .insert(1, "demo".into(), 4242, test_view(), RENDER_OPTIONS);
+        console.sessions.insert(
+            1,
+            "demo".into(),
+            4242,
+            StreamKind::Tokens,
+            test_view(),
+            RENDER_OPTIONS,
+        );
         let view_id = ViewId::from_u16(7);
         console.session_windows.insert(1, view_id);
         console.window_ids.insert(view_id, 1);
@@ -623,9 +689,14 @@ mod console_decision_tests {
     #[test]
     fn attached_first_attach_also_decides_to_retitle_the_mapped_window() {
         let mut console = Console::default();
-        console
-            .sessions
-            .insert(1, "demo".into(), 4242, test_view(), RENDER_OPTIONS);
+        console.sessions.insert(
+            1,
+            "demo".into(),
+            4242,
+            StreamKind::Tokens,
+            test_view(),
+            RENDER_OPTIONS,
+        );
         let view_id = ViewId::from_u16(8);
         console.session_windows.insert(1, view_id);
         console.window_ids.insert(view_id, 1);
@@ -651,9 +722,14 @@ mod console_decision_tests {
     #[test]
     fn closed_decides_to_close_the_mapped_window_and_forgets_it() {
         let mut console = Console::default();
-        console
-            .sessions
-            .insert(1, "demo".into(), 4242, test_view(), RENDER_OPTIONS);
+        console.sessions.insert(
+            1,
+            "demo".into(),
+            4242,
+            StreamKind::Tokens,
+            test_view(),
+            RENDER_OPTIONS,
+        );
         let view_id = ViewId::from_u16(9);
         console.session_windows.insert(1, view_id);
         console.window_ids.insert(view_id, 1);
@@ -669,9 +745,14 @@ mod console_decision_tests {
     #[test]
     fn closed_with_no_mapped_window_decides_nothing() {
         let mut console = Console::default();
-        console
-            .sessions
-            .insert(1, "demo".into(), 4242, test_view(), RENDER_OPTIONS);
+        console.sessions.insert(
+            1,
+            "demo".into(),
+            4242,
+            StreamKind::Tokens,
+            test_view(),
+            RENDER_OPTIONS,
+        );
         let intent = console.decide_server_event(ServerEvent::Closed { id: 1 });
         assert_eq!(intent, None);
     }
