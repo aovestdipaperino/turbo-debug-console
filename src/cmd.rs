@@ -12,9 +12,5 @@ use turbo_vision::core::command::CommandId;
 pub const CM_OPEN_CAPTURE: CommandId = 1000;
 /// File > Save As...
 pub const CM_SAVE_AS: CommandId = 1001;
-/// View > Show thinking
-pub const CM_SHOW_THINKING: CommandId = 1002;
-/// View > Markdown
-pub const CM_SHOW_MARKDOWN: CommandId = 1003;
 /// View > Clear window
 pub const CM_CLEAR_WINDOW: CommandId = 1004;

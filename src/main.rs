@@ -40,6 +40,17 @@ const MAX_EVENTS_PER_TICK: usize = 64;
 /// The well-known control port clients `HELLO` into.
 const CONTROL_PORT: u16 = 7878;
 
+/// The render options every `Pipeline` is created with. Thinking text and
+/// markdown formatting are always on -- a debug console that can be put
+/// into a state where it does not format its input is a worse tool, so
+/// these are no longer user-toggleable (see the removed View > Show
+/// thinking / View > Markdown menu items).
+const RENDER_OPTIONS: RenderOptions = RenderOptions {
+    use_color: true,
+    format_thinking: true,
+    format_markdown: true,
+};
+
 /// Handles `--version` / `--help` and exits, before any terminal setup.
 ///
 /// Both must be answered without initialising the UI: the terminal goes into
@@ -161,9 +172,8 @@ fn main() -> turbo_vision::core::error::Result<()> {
     Ok(())
 }
 
-/// Everything the main loop mutates across frames: live sessions, the
-/// `ViewId <-> SessionId` maps needed to find the focused window's session,
-/// and the current render options.
+/// Everything the main loop mutates across frames: live sessions and the
+/// `ViewId <-> SessionId` maps needed to find the focused window's session.
 ///
 /// `window_ids` maps a desktop `ViewId` to the session it belongs to, and is
 /// how the focused window's session id is found each frame. **Deviation
@@ -179,7 +189,6 @@ struct Console {
     sessions: Sessions,
     window_ids: HashMap<ViewId, SessionId>,
     session_windows: HashMap<SessionId, ViewId>,
-    opts: RenderOptionsState,
 }
 
 /// What a decided [`ServerEvent`] means for the desktop: create a window for
@@ -202,19 +211,6 @@ enum ConsoleIntent {
     },
 }
 
-/// `RenderOptions` doesn't implement `Default`; this does, so `Console` can.
-struct RenderOptionsState(RenderOptions);
-
-impl Default for RenderOptionsState {
-    fn default() -> Self {
-        Self(RenderOptions {
-            use_color: true,
-            format_thinking: true,
-            format_markdown: true,
-        })
-    }
-}
-
 impl Console {
     fn handle_command(
         &mut self,
@@ -227,14 +223,6 @@ impl Console {
             .and_then(|id| self.window_ids.get(&id).copied());
 
         match command {
-            cmd::CM_SHOW_THINKING => {
-                self.opts.0.format_thinking = !self.opts.0.format_thinking;
-                self.sessions.set_options(self.opts.0);
-            }
-            cmd::CM_SHOW_MARKDOWN => {
-                self.opts.0.format_markdown = !self.opts.0.format_markdown;
-                self.sessions.set_options(self.opts.0);
-            }
             cmd::CM_CLEAR_WINDOW => {
                 if let Some(id) = focused_id {
                     self.sessions.clear(id);
@@ -316,7 +304,7 @@ impl Console {
                     window_bounds,
                 ))));
                 self.sessions
-                    .insert(id, name.clone(), port, Rc::clone(&view), self.opts.0);
+                    .insert(id, name.clone(), port, Rc::clone(&view), RENDER_OPTIONS);
                 let mut window = WindowBuilder::new()
                     .bounds(window_bounds)
                     .title(format_title(&name, port))
@@ -420,7 +408,7 @@ impl Console {
         let id = NEXT_CAPTURE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         self.sessions
-            .insert(id, name.clone(), 0, Rc::clone(&view), self.opts.0);
+            .insert(id, name.clone(), 0, Rc::clone(&view), RENDER_OPTIONS);
         if let Some(state) = self.sessions.get_mut(id) {
             state.connected = true;
             state.pipeline.feed(&bytes, &mut view.borrow_mut());
@@ -502,11 +490,12 @@ fn build_menu_bar(width: i16) -> MenuBar {
     ));
     menu_bar.add_submenu(SubMenu::new(
         "~V~iew",
-        Menu::from_items(vec![
-            MenuItem::new("Show ~t~hinking", cmd::CM_SHOW_THINKING, 0, 0),
-            MenuItem::new("~M~arkdown", cmd::CM_SHOW_MARKDOWN, 0, 0),
-            MenuItem::new("~C~lear window", cmd::CM_CLEAR_WINDOW, 0, 0),
-        ]),
+        Menu::from_items(vec![MenuItem::new(
+            "~C~lear window",
+            cmd::CM_CLEAR_WINDOW,
+            0,
+            0,
+        )]),
     ));
     menu_bar.add_submenu(SubMenu::new(
         "~W~indow",
@@ -594,7 +583,7 @@ mod console_decision_tests {
         let mut console = Console::default();
         console
             .sessions
-            .insert(1, "demo".into(), 4242, test_view(), console.opts.0);
+            .insert(1, "demo".into(), 4242, test_view(), RENDER_OPTIONS);
         let intent = console.decide_server_event(ServerEvent::Bytes {
             id: 1,
             data: b"hello\n".to_vec(),
@@ -608,7 +597,7 @@ mod console_decision_tests {
         let mut console = Console::default();
         console
             .sessions
-            .insert(1, "demo".into(), 4242, test_view(), console.opts.0);
+            .insert(1, "demo".into(), 4242, test_view(), RENDER_OPTIONS);
         let view_id = ViewId::from_u16(7);
         console.session_windows.insert(1, view_id);
         console.window_ids.insert(view_id, 1);
@@ -636,7 +625,7 @@ mod console_decision_tests {
         let mut console = Console::default();
         console
             .sessions
-            .insert(1, "demo".into(), 4242, test_view(), console.opts.0);
+            .insert(1, "demo".into(), 4242, test_view(), RENDER_OPTIONS);
         let view_id = ViewId::from_u16(8);
         console.session_windows.insert(1, view_id);
         console.window_ids.insert(view_id, 1);
@@ -664,7 +653,7 @@ mod console_decision_tests {
         let mut console = Console::default();
         console
             .sessions
-            .insert(1, "demo".into(), 4242, test_view(), console.opts.0);
+            .insert(1, "demo".into(), 4242, test_view(), RENDER_OPTIONS);
         let view_id = ViewId::from_u16(9);
         console.session_windows.insert(1, view_id);
         console.window_ids.insert(view_id, 1);
@@ -682,7 +671,7 @@ mod console_decision_tests {
         let mut console = Console::default();
         console
             .sessions
-            .insert(1, "demo".into(), 4242, test_view(), console.opts.0);
+            .insert(1, "demo".into(), 4242, test_view(), RENDER_OPTIONS);
         let intent = console.decide_server_event(ServerEvent::Closed { id: 1 });
         assert_eq!(intent, None);
     }

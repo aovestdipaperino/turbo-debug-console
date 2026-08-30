@@ -155,15 +155,6 @@ impl Sessions {
         }
     }
 
-    /// Applies new render options to every session. Text already on screen
-    /// keeps the styling it was rendered with; only new bytes change.
-    pub fn set_options(&mut self, opts: RenderOptions) {
-        for s in self.inner.values_mut() {
-            let mut view = s.view.borrow_mut();
-            s.pipeline.set_options(opts, &mut view);
-        }
-    }
-
     /// Empties one session's scrollback.
     pub fn clear(&mut self, id: SessionId) {
         if let Some(s) = self.inner.get_mut(&id) {
@@ -277,23 +268,6 @@ mod tests {
         sessions.feed(1, b"hello\n");
         sessions.clear(1);
         assert_eq!(sessions.plain_text(1).unwrap(), "");
-    }
-
-    #[test]
-    fn set_options_applies_to_every_session() {
-        let mut sessions = Sessions::default();
-        sessions.insert(1, "demo".into(), 4242, view(), opts());
-        let mut new_opts = opts();
-        new_opts.format_markdown = false;
-        sessions.set_options(new_opts);
-        assert!(
-            !sessions
-                .get_mut(1)
-                .unwrap()
-                .pipeline
-                .options()
-                .format_markdown
-        );
     }
 
     #[test]

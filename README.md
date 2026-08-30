@@ -88,8 +88,9 @@ Scrolling back releases autoscroll; `End` re-arms it, so a window you are
 reading does not yank itself to the bottom when new output arrives.
 
 **File** opens a saved capture into a new window, or writes the focused
-window's transcript out as plain text. **View** toggles thinking text and
-markdown rendering, and clears a window. **Window** tiles, cascades and cycles.
+window's transcript out as plain text. **View** clears a window; thinking
+text and markdown rendering are always on, not toggles. **Window** tiles,
+cascades and cycles.
 
 ## How it renders
 
