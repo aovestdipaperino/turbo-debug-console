@@ -1076,7 +1076,7 @@ dependencies = [
 
 [[package]]
 name = "turbo-debug-console"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde_json",
  "trace-stream",
@@ -1086,9 +1086,9 @@ dependencies = [
 
 [[package]]
 name = "turbo-vision"
-version = "2.0.0"
+version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7175208a96f79836de8b06f24080568b5f2663fa85c277f0b8a640827377c39"
+checksum = "9d5f8ebfd44b34631fbe455826c14258028a452b143b1af201ed3159dd72fa17"
 dependencies = [
  "arboard",
  "base64",

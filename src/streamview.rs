@@ -11,6 +11,7 @@ use turbo_vision::core::event::{
 };
 use turbo_vision::core::geometry::Rect;
 use turbo_vision::core::palette::{Attr, TvColor};
+use turbo_vision::core::state::{GF_GROW_HI_X, GF_GROW_HI_Y, GrowFlags};
 use turbo_vision::terminal::Terminal;
 use turbo_vision::views::view::{View, write_line_to_terminal};
 
@@ -159,6 +160,14 @@ fn wrap_cells(cells: &[Cell], width: usize) -> Vec<Vec<Cell>> {
 #[derive(Debug)]
 pub struct StreamView {
     bounds: Rect,
+    /// How this view follows its parent when the terminal is resized.
+    ///
+    /// `View`'s default is 0, meaning fixed, and a fixed view is skipped by
+    /// the desktop's resize cascade: the window frame would resize around a
+    /// scrollback still wrapped for the old width. `HI_X | HI_Y` pins the
+    /// top-left and moves the bottom-right edge, which is what a view that
+    /// fills its window wants.
+    grow_mode: GrowFlags,
     /// Completed lines, oldest first. This is the source of truth: the log
     /// text as the producer sent it, one entry per logical line, never
     /// baked with this window's current wrap points. `plain_text()` reads
@@ -196,6 +205,7 @@ impl StreamView {
     pub fn new(bounds: Rect) -> Self {
         Self {
             bounds,
+            grow_mode: GF_GROW_HI_X | GF_GROW_HI_Y,
             lines: Vec::new(),
             partial: None,
             wrapped: Vec::new(),
@@ -426,6 +436,14 @@ impl View for StreamView {
             _ => return,
         }
         event.clear();
+    }
+
+    fn grow_mode(&self) -> GrowFlags {
+        self.grow_mode
+    }
+
+    fn set_grow_mode(&mut self, grow_mode: GrowFlags) {
+        self.grow_mode = grow_mode;
     }
 
     fn can_focus(&self) -> bool {

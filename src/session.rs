@@ -42,6 +42,16 @@ impl View for SharedStreamView {
     fn can_focus(&self) -> bool {
         true
     }
+    // A view that does not delegate these inherits `View`'s fixed default, so
+    // the desktop's resize cascade reaches the window, asks this child whether
+    // it grows, is told no, and leaves it at the old width. The window frame
+    // then resizes around a view still wrapped for the old geometry.
+    fn grow_mode(&self) -> turbo_vision::core::state::GrowFlags {
+        self.0.borrow().grow_mode()
+    }
+    fn set_grow_mode(&mut self, grow_mode: turbo_vision::core::state::GrowFlags) {
+        self.0.borrow_mut().set_grow_mode(grow_mode);
+    }
     fn get_palette(&self) -> Option<turbo_vision::core::palette::Palette> {
         None
     }
