@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    # The console drives a terminal, but every test in the suite runs headless:
+    # the view tests build a real Terminal over an in-memory backend, and the
+    # protocol tests bind ephemeral loopback ports. No TTY is required.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets
+
+      # The protocol suite is concurrent -- threads per connection, sessions
+      # reaped on a timer, a self-connect used to wake a blocked accept. A race
+      # here would surface as a rare CI failure nobody can reproduce, so it is
+      # run repeatedly rather than once.
+      - name: Protocol suite, repeated
+        run: for i in $(seq 10); do cargo test --test protocol || exit 1; done

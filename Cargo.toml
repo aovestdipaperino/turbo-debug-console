@@ -1,24 +1,33 @@
 [package]
-name = "plank-console"
+name = "turbo-debug-console"
 version = "0.1.0"
-description = "Turbo Vision monitor that renders a plank model-token stream over a socket"
-edition.workspace = true
-rust-version.workspace = true
-authors.workspace = true
-license.workspace = true
-repository.workspace = true
+description = "Turbo Vision monitor that renders a model-token stream over a socket"
+edition = "2024"
+rust-version = "1.93"
+authors = ["Enzo Lombardi <enzinol@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/aovestdipaperino/turbo-debug-console"
+readme = "README.md"
+keywords = ["tui", "debug", "turbo-vision", "console", "streaming"]
+categories = ["command-line-utilities", "development-tools::debugging"]
 
 [lib]
-name = "plank_console"
+name = "turbo_debug_console"
 path = "src/lib.rs"
 
 [[bin]]
-name = "plank-console"
+name = "turbo-debug-console"
 path = "src/main.rs"
 
 [dependencies]
-plank-stream = { path = "../plank-stream" }
-turbo-vision = { path = "../../refs/turbo-vision" }
+trace-stream = "0.1"
+turbo-vision = "2.0"
 
-[lints]
-workspace = true
+[lints.rust]
+missing_debug_implementations = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }

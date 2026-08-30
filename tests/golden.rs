@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: MIT
 
 //! End-to-end: a recorded stream through the whole pipeline, asserted as a
-//! rendered cell grid. Regenerate with `PLANK_REGEN_GOLDEN=1 cargo test -p plank-console`.
+//! rendered cell grid. Regenerate with `PLANK_REGEN_GOLDEN=1 cargo test -p turbo-debug-console`.
 
-use plank_console::pipeline::Pipeline;
-use plank_console::streamview::StreamView;
-use plank_stream::render::RenderOptions;
+use trace_stream::render::RenderOptions;
+use turbo_debug_console::pipeline::Pipeline;
+use turbo_debug_console::streamview::StreamView;
 use turbo_vision::core::geometry::Rect;
 
 /// The DSML shape here is taken verbatim from the template `sysprompt.rs`

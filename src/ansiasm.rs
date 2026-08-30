@@ -7,7 +7,7 @@ use turbo_vision::core::ansi::AnsiParser;
 use turbo_vision::core::draw::Cell;
 use turbo_vision::core::palette::{Attr, TvColor};
 
-/// `\r\x1b[0K` — cursor to column 0, erase to end of line. `plank_stream`
+/// `\r\x1b[0K` — cursor to column 0, erase to end of line. `trace_stream`
 /// emits exactly this byte sequence when it repaints a fenced code block's
 /// first line once the language is known.
 const ERASE_LINE: &[u8] = b"\r\x1b[0K";
@@ -114,7 +114,7 @@ impl AnsiLineAssembler {
             } else {
                 self.pending.push(b);
                 if self.pending.ends_with(ERASE_LINE) {
-                    // `plank_stream`'s fence highlighter repaints a line it
+                    // `trace_stream`'s fence highlighter repaints a line it
                     // already wrote plain by moving the cursor home and
                     // erasing to end of line, then rewriting it highlighted.
                     // `AnsiParser` has no concept of cursor position or
@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn fence_repaint_replaces_the_line_instead_of_appending_to_it() {
-        // `plank_stream`'s fence highlighter writes a code line plain, then
+        // `trace_stream`'s fence highlighter writes a code line plain, then
         // once it learns the language, repaints it: `\r\x1b[0K` moves the
         // cursor to column 0 and erases to end of line, followed by the
         // syntax-highlighted rewrite. `AnsiParser` has no concept of cursor
@@ -308,7 +308,7 @@ mod tests {
 
     #[test]
     fn trailing_sgr_after_the_last_char_does_not_bleed_into_the_next_line() {
-        // `plank_stream` closes `<think>` with a reset that lands *after*
+        // `trace_stream` closes `<think>` with a reset that lands *after*
         // the last visible character on the line, e.g. `...pondering\x1b[0m`.
         // The old code took `carry` from the last cell's attribute, which
         // predates that trailing reset — dropping it and letting the

@@ -339,8 +339,13 @@ fn handle_control(
                 let _ = writeln!(writer, "ERR no port");
             }
         },
-        Err(HelloError::BadName) => {
-            let _ = writeln!(writer, "{}", HelloError::BadName.wire());
+        Err(
+            e @ (HelloError::BadName
+            | HelloError::MissingVersion
+            | HelloError::BadVersion
+            | HelloError::UnsupportedVersion(_)),
+        ) => {
+            let _ = writeln!(writer, "{}", e.wire());
         }
         Err(HelloError::NotHello) => {
             // Not a handshake: an anonymous raw stream. The line already read
@@ -568,7 +573,10 @@ mod guard_generation_tests {
     fn outrun_guard_does_not_clobber_a_newer_attachment() {
         let sessions: Arc<Mutex<HashMap<String, Session>>> = Arc::new(Mutex::new(HashMap::new()));
         let name = "race".to_string();
-        sessions.lock().unwrap().insert(name.clone(), make_session(4242));
+        sessions
+            .lock()
+            .unwrap()
+            .insert(name.clone(), make_session(4242));
 
         let (tx, rx) = channel();
         let outrun_guard = LiveGuard {
@@ -614,7 +622,10 @@ mod guard_generation_tests {
     fn current_guard_tears_down_normally() {
         let sessions: Arc<Mutex<HashMap<String, Session>>> = Arc::new(Mutex::new(HashMap::new()));
         let name = "race".to_string();
-        sessions.lock().unwrap().insert(name.clone(), make_session(4242));
+        sessions
+            .lock()
+            .unwrap()
+            .insert(name.clone(), make_session(4242));
 
         let (tx, rx) = channel();
         let guard = LiveGuard {

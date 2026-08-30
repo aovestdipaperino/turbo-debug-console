@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use plank_stream::render::RenderOptions;
+use trace_stream::render::RenderOptions;
 use turbo_vision::core::event::Event;
 use turbo_vision::core::geometry::Rect;
 use turbo_vision::terminal::Terminal;
@@ -189,7 +189,7 @@ impl Sessions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plank_stream::render::RenderOptions;
+    use trace_stream::render::RenderOptions;
 
     fn opts() -> RenderOptions {
         RenderOptions {

@@ -8,13 +8,13 @@
 //!       -> AnsiLineAssembler -> Vec<Cell> -> StreamView
 //! ```
 //!
-//! The renderer is the same `plank_stream` code plank's plain-stdout REPL
+//! The renderer is the same `trace_stream` code plank's plain-stdout REPL
 //! runs, given a `Vec<u8>` instead of a terminal, so the two applications
 //! cannot drift.
 
-use plank_stream::TerminalSink;
-use plank_stream::render::{RenderOptions, TokenRenderer};
-use plank_stream::viz::StreamRenderer;
+use trace_stream::TerminalSink;
+use trace_stream::render::{RenderOptions, TokenRenderer};
+use trace_stream::viz::StreamRenderer;
 
 use crate::ansiasm::AnsiLineAssembler;
 use crate::streamview::StreamView;
@@ -194,7 +194,7 @@ mod tests {
     }
 
     /// Invented, non-DSML markup (a bare `<read>` opening a line) must never
-    /// be silently dispatched as a real tool call — `plank_stream`'s
+    /// be silently dispatched as a real tool call — `trace_stream`'s
     /// `PseudoToolDetector` catches it and reports it as an error instead.
     #[test]
     fn invented_pseudo_tool_markup_is_rejected_not_dispatched() {

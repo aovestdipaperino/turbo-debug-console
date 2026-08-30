@@ -1,18 +1,18 @@
 // Copyright (c) 2026 Enzo Lombardi
 // SPDX-License-Identifier: MIT
 
-//! `plank-console` — a Turbo Vision monitor for plank model-token streams.
+//! `turbo-debug-console` — a Turbo Vision monitor for model-token streams.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use plank_console::cmd;
-use plank_console::registry::{Server, ServerEvent, SessionId};
-use plank_console::session::{Sessions, SharedStreamView, format_title};
-use plank_console::streamview::StreamView;
-use plank_stream::render::RenderOptions;
+use trace_stream::render::RenderOptions;
+use turbo_debug_console::cmd;
+use turbo_debug_console::registry::{Server, ServerEvent, SessionId};
+use turbo_debug_console::session::{Sessions, SharedStreamView, format_title};
+use turbo_debug_console::streamview::StreamView;
 use turbo_vision::app::Application;
 use turbo_vision::core::command::{CM_CASCADE, CM_CLOSE, CM_NEXT, CM_QUIT, CM_TILE};
 use turbo_vision::core::event::{EventType, KB_ALT_X, KB_F6, KB_F10};
@@ -36,21 +36,22 @@ use turbo_vision::views::window::{Window, WindowBuilder};
 /// draw happens to be on the day it is run).
 const MAX_EVENTS_PER_TICK: usize = 64;
 
-fn main() -> turbo_vision::core::error::Result<()> {
-    let control_port = parse_port_arg();
+/// The well-known control port clients `HELLO` into.
+const CONTROL_PORT: u16 = 7878;
 
+fn main() -> turbo_vision::core::error::Result<()> {
     let mut app = Application::new()?;
     let (width, height) = app.terminal.size();
     app.set_menu_bar(build_menu_bar(width));
     app.set_status_line(build_status_line(width, height, 0));
 
-    let mut server = match Server::bind(control_port) {
+    let mut server = match Server::bind(CONTROL_PORT) {
         Ok(s) => s,
         Err(e) => {
             // The terminal is already in raw mode; drop out of it before
             // printing, or the message lands in a half-torn-down screen.
             drop(app);
-            eprintln!("plank-console: cannot bind 127.0.0.1:{control_port}: {e}");
+            eprintln!("turbo-debug-console: cannot bind 127.0.0.1:{CONTROL_PORT}: {e}");
             std::process::exit(1);
         }
     };
@@ -440,22 +441,6 @@ fn apply_session_window_palette(window: &mut Window) {
     window.set_custom_palette(vec![97, 98, 99, 100, 101, 102, 103, 104]);
 }
 
-/// Reads `--port <n>` from argv; defaults to 7878.
-fn parse_port_arg() -> u16 {
-    let args: Vec<String> = std::env::args().collect();
-    let mut i = 1;
-    while i < args.len() {
-        if args[i] == "--port"
-            && let Some(v) = args.get(i + 1)
-            && let Ok(p) = v.parse::<u16>()
-        {
-            return p;
-        }
-        i += 1;
-    }
-    7878
-}
-
 fn build_menu_bar(width: i16) -> MenuBar {
     let mut menu_bar = MenuBar::new(Rect::new(0, 0, width, 1));
 
@@ -537,7 +522,7 @@ static NEXT_CAPTURE_ID: std::sync::atomic::AtomicU64 =
 #[cfg(test)]
 mod console_decision_tests {
     use super::*;
-    use plank_console::registry::ServerEvent;
+    use turbo_debug_console::registry::ServerEvent;
 
     #[test]
     fn opened_decides_to_create_a_window() {
@@ -655,7 +640,7 @@ mod console_decision_tests {
         assert_eq!(intent, None);
     }
 
-    fn test_view() -> plank_console::session::SharedView {
+    fn test_view() -> turbo_debug_console::session::SharedView {
         std::rc::Rc::new(std::cell::RefCell::new(StreamView::new(Rect::new(
             0, 0, 80, 24,
         ))))
@@ -770,7 +755,7 @@ mod title_render_tests {
     /// inside the frame on every side.
     #[test]
     fn stream_view_bounds_land_inside_the_frame_not_over_it() {
-        use plank_console::streamview::StreamView;
+        use turbo_debug_console::streamview::StreamView;
 
         let window_bounds = Rect::new(0, 0, 40, 20);
         let view_bounds = super::session_view_bounds(window_bounds);
@@ -800,7 +785,7 @@ mod title_render_tests {
     /// and bottom border instead of stopping at the interior's edge.
     #[test]
     fn outer_bounds_overflow_the_interior_by_the_frame_width() {
-        use plank_console::streamview::StreamView;
+        use turbo_debug_console::streamview::StreamView;
 
         let window_bounds = Rect::new(0, 0, 40, 20);
         let mut window = WindowBuilder::new()

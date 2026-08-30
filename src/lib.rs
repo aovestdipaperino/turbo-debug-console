@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Enzo Lombardi
 // SPDX-License-Identifier: MIT
 
-//! Library half of `plank-console`, so integration tests can drive the
+//! Library half of `turbo-debug-console`, so integration tests can drive the
 //! pipeline and the protocol without a terminal.
 
 pub mod ansiasm;
