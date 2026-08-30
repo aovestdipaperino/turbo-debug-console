@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use trace_stream::render::RenderOptions;
 use turbo_debug_console::cmd;
+use turbo_debug_console::proto::PROTOCOL_VERSION;
 use turbo_debug_console::registry::{Server, ServerEvent, SessionId};
 use turbo_debug_console::session::{Sessions, SharedStreamView, format_title};
 use turbo_debug_console::streamview::StreamView;
@@ -39,7 +40,53 @@ const MAX_EVENTS_PER_TICK: usize = 64;
 /// The well-known control port clients `HELLO` into.
 const CONTROL_PORT: u16 = 7878;
 
+/// Handles `--version` / `--help` and exits, before any terminal setup.
+///
+/// Both must be answered without initialising the UI: the terminal goes into
+/// raw mode as soon as `Application::new` runs, and a packager smoke-testing
+/// the binary (`brew test`) has no TTY to give it.
+fn handle_cli_flags() {
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "-V" | "--version" => {
+                println!("turbo-debug-console {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            "-h" | "--help" => {
+                println!(
+                    "turbo-debug-console {}\n\
+                     {}\n\
+                     \n\
+                     USAGE:\n    turbo-debug-console\n\
+                     \n\
+                     Takes no options: it listens on the fixed control port {CONTROL_PORT}.\n\
+                     \n\
+                     Name a session and get a port to stream at:\n\
+                     \n    printf 'HELLO {PROTOCOL_VERSION} build\\n' | nc 127.0.0.1 {CONTROL_PORT}\n\
+                     \n\
+                     Or skip the handshake -- anything that is not a HELLO is\n\
+                     rendered as a raw stream in its own window:\n\
+                     \n    cat capture.txt | nc 127.0.0.1 {CONTROL_PORT}\n\
+                     \n\
+                     KEYS\n    \
+                     F10 menu   F6 next window   Alt-X quit\n    \
+                     PgUp/PgDn/Home/End scroll the focused window\n\
+                     \n\
+                     {}",
+                    env!("CARGO_PKG_VERSION"),
+                    env!("CARGO_PKG_DESCRIPTION"),
+                    env!("CARGO_PKG_REPOSITORY"),
+                );
+                std::process::exit(0);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn main() -> turbo_vision::core::error::Result<()> {
+    handle_cli_flags();
+
     let mut app = Application::new()?;
     let (width, height) = app.terminal.size();
     app.set_menu_bar(build_menu_bar(width));
