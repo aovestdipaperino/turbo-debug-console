@@ -376,6 +376,125 @@ mod tests {
             .expect("fake backend never fails to init")
     }
 
+    /// A `Backend` that records every byte `Terminal::flush` actually sends
+    /// downstream, via a shared buffer -- the write-through path
+    /// `FakeBackend` above stubs out. `Terminal::flush` is the one place
+    /// that decides what physically reaches a real terminal (it does a
+    /// diffed, escape-coded re-encode of the cell buffer, and knowingly
+    /// skips `'\0'` filler cells), so a bug specific to *that* encoding is
+    /// invisible to any test that only inspects `Terminal::read_cell`,
+    /// which reflects the in-memory cell buffer `write_line` always
+    /// updates unconditionally.
+    #[derive(Clone, Default)]
+    struct RecordingBackend {
+        width: u16,
+        height: u16,
+        output: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl Backend for RecordingBackend {
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+
+        fn init(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn cleanup(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn size(&self) -> io::Result<(u16, u16)> {
+            Ok((self.width, self.height))
+        }
+
+        fn poll_event(&mut self, _timeout: Duration) -> io::Result<Option<Event>> {
+            Ok(None)
+        }
+
+        fn write_raw(&mut self, data: &[u8]) -> io::Result<()> {
+            self.output.lock().unwrap().extend_from_slice(data);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn show_cursor(&mut self, _x: u16, _y: u16) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Builds a `Terminal` whose every `flush`-emitted byte lands in the
+    /// returned buffer, so a test can inspect what actually reaches a real
+    /// terminal rather than only the in-memory cell buffer.
+    fn recording_terminal(
+        width: u16,
+        height: u16,
+    ) -> (Terminal, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend = RecordingBackend {
+            width,
+            height,
+            output: output.clone(),
+        };
+        let terminal =
+            Terminal::with_backend(Box::new(backend)).expect("fake backend never fails to init");
+        (terminal, output)
+    }
+
+    /// Replays `flush`'s escape-coded byte stream onto a plain grid the way
+    /// a real terminal would: `ESC[row;colH` repositions the cursor
+    /// (1-indexed), an SGR color sequence is consumed and ignored, and every
+    /// other character is placed at the cursor and advances it by its own
+    /// display width -- 2 for a double-width glyph, 0 for a combining or
+    /// selector character, exactly as a real terminal renders it (not by
+    /// our internal one-`Cell`-per-logical-column bookkeeping, which is
+    /// precisely what could drift from physical reality). Bytes from
+    /// successive flushes are replayed in order onto the same grid, since a
+    /// real terminal's screen persists across flushes the same way.
+    fn replay_onto_grid(bytes: &[u8], grid: &mut [Vec<char>]) {
+        let text = std::str::from_utf8(bytes).expect("flush emits valid UTF-8");
+        let mut chars = text.chars().peekable();
+        let mut row = 0usize;
+        let mut col = 0usize;
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' && chars.peek() == Some(&'[') {
+                chars.next(); // consume '['
+                let mut params = String::new();
+                let mut final_byte = ' ';
+                for pc in chars.by_ref() {
+                    if pc.is_ascii_digit() || pc == ';' {
+                        params.push(pc);
+                    } else {
+                        final_byte = pc;
+                        break;
+                    }
+                }
+                if final_byte == 'H' {
+                    let mut parts = params.split(';');
+                    let r: usize = parts.next().and_then(|p| p.parse().ok()).unwrap_or(1);
+                    let cix: usize = parts.next().and_then(|p| p.parse().ok()).unwrap_or(1);
+                    row = r.saturating_sub(1);
+                    col = cix.saturating_sub(1);
+                }
+                // An SGR ('m') sequence carries no cursor movement.
+                continue;
+            }
+            let width = c.width().unwrap_or(0);
+            if row < grid.len() && col < grid[row].len() {
+                grid[row][col] = c;
+            }
+            col += width;
+        }
+    }
+
     #[test]
     fn scrollback_cap_drops_oldest_lines() {
         let mut v = view();
@@ -604,6 +723,52 @@ mod tests {
         let mut v = view();
         v.push_line(&line(&format!("{WRENCH} Reading src/dsml.rs")));
         assert_eq!(v.plain_text(), format!("{WRENCH} Reading src/dsml.rs"));
+    }
+
+    /// Reproduces the real, two-window bug: a lower window paints a row
+    /// containing plank's real tool-call banner glyph and *flushes* it (not
+    /// just `draw`s it -- the defect lives in what `Terminal::flush` sends
+    /// downstream, invisible to any test that only checks
+    /// `Terminal::read_cell`, since `write_line` updates the in-memory cell
+    /// buffer unconditionally regardless of what flush later encodes). A
+    /// second, unrelated window then opens on top with the same bounds and
+    /// paints an all-blank row over the identical region, and flushes too.
+    /// A real terminal's screen must show nothing left over from the first
+    /// window afterwards.
+    #[test]
+    fn a_covering_window_s_flush_fully_blanks_a_row_that_held_a_wide_character() {
+        let (mut terminal, output) = recording_terminal(30, 4);
+        let mut grid = vec![vec![' '; 30]; 4];
+
+        // Lower window: the real banner line at row 0, drawn and flushed.
+        let mut lower = StreamView::new(Rect::new(0, 0, 30, 4));
+        lower.push_line(&line(&format!("{WRENCH} Reading src/dsml.rs 1:500...")));
+        lower.draw(&mut terminal);
+        terminal
+            .flush()
+            .expect("flush never fails against a fake backend");
+        replay_onto_grid(&output.lock().unwrap(), &mut grid);
+        output.lock().unwrap().clear();
+
+        // Upper window: same bounds, no content of its own at all -- opens
+        // on top and must blank every column of row 0 that the lower
+        // window's banner occupied.
+        let mut upper = StreamView::new(Rect::new(0, 0, 30, 4));
+        upper.draw(&mut terminal);
+        terminal
+            .flush()
+            .expect("flush never fails against a fake backend");
+        replay_onto_grid(&output.lock().unwrap(), &mut grid);
+
+        // Row 0 must now be fully blank -- nothing from the lower window's
+        // banner may still show through.
+        for (col, &ch) in grid[0].iter().enumerate() {
+            assert_eq!(
+                ch, ' ',
+                "row 0 column {col} still shows a leftover character from \
+                 the window underneath: {grid:?}"
+            );
+        }
     }
 
     #[test]

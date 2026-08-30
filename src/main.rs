@@ -921,3 +921,194 @@ mod title_render_tests {
         );
     }
 }
+
+/// Reproduces the two-window overlap bug end to end -- the real `Window` +
+/// `Desktop` compositing (not just a bare `StreamView` painting into a bare
+/// `Terminal`, which does not reproduce it; see `streamview.rs`'s own
+/// `a_covering_window_s_flush_fully_blanks_a_row_that_held_a_wide_character`,
+/// which passes against unfixed code). A lower window's content contains
+/// plank's real tool-call banner glyph on a row beyond the upper window's
+/// own two lines; the upper window opens on top at the same bounds (as
+/// `tile_window_bounds` hands every new window, no auto-tiling). One
+/// `Desktop::draw` + `Terminal::flush` cycle (matching `main`'s per-tick
+/// `app.draw()` + one flush) must leave that row fully blank -- nothing
+/// from the window underneath may still show through.
+#[cfg(test)]
+mod window_overlap_tests {
+    use std::cell::RefCell;
+    use std::io;
+    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use turbo_debug_console::session::SharedStreamView;
+    use turbo_debug_console::streamview::StreamView;
+    use turbo_vision::core::draw::Cell;
+    use turbo_vision::core::event::Event;
+    use turbo_vision::core::geometry::Rect;
+    use turbo_vision::core::palette::{Attr, TvColor};
+    use turbo_vision::terminal::{Backend, Terminal};
+    use turbo_vision::views::desktop::Desktop;
+    use turbo_vision::views::view::View;
+    use turbo_vision::views::window::WindowBuilder;
+
+    /// The exact banner glyph plank emits: U+1F6E0 HAMMER AND WRENCH
+    /// followed by U+FE0F VARIATION SELECTOR-16.
+    const WRENCH: &str = "\u{1F6E0}\u{FE0F}";
+
+    fn line(s: &str) -> Vec<Cell> {
+        s.chars()
+            .map(|c| Cell::new(c, Attr::new(TvColor::LightGray, TvColor::Black)))
+            .collect()
+    }
+
+    /// Records every byte `Terminal::flush` sends downstream, so a test can
+    /// inspect what actually reaches a real terminal (the diffed,
+    /// escape-coded re-encode of the cell buffer) rather than only the
+    /// in-memory buffer `write_line` always updates unconditionally.
+    #[derive(Clone, Default)]
+    struct RecordingBackend {
+        width: u16,
+        height: u16,
+        output: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Backend for RecordingBackend {
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn init(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn cleanup(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn size(&self) -> io::Result<(u16, u16)> {
+            Ok((self.width, self.height))
+        }
+        fn poll_event(&mut self, _timeout: Duration) -> io::Result<Option<Event>> {
+            Ok(None)
+        }
+        fn write_raw(&mut self, data: &[u8]) -> io::Result<()> {
+            self.output.lock().unwrap().extend_from_slice(data);
+            Ok(())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn show_cursor(&mut self, _x: u16, _y: u16) -> io::Result<()> {
+            Ok(())
+        }
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Replays `flush`'s escape-coded byte stream onto a plain grid the way
+    /// a real terminal would: `ESC[row;colH` repositions the cursor
+    /// (1-indexed), an SGR color sequence is consumed and ignored, and
+    /// every other character is placed at the cursor and advances it by
+    /// its own display width, exactly as a real terminal renders it.
+    fn replay_onto_grid(bytes: &[u8], grid: &mut [Vec<char>]) {
+        use unicode_width::UnicodeWidthChar;
+        let text = std::str::from_utf8(bytes).expect("flush emits valid UTF-8");
+        let mut chars = text.chars().peekable();
+        let mut row = 0usize;
+        let mut col = 0usize;
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' && chars.peek() == Some(&'[') {
+                chars.next();
+                let mut params = String::new();
+                let mut final_byte = ' ';
+                for pc in chars.by_ref() {
+                    if pc.is_ascii_digit() || pc == ';' {
+                        params.push(pc);
+                    } else {
+                        final_byte = pc;
+                        break;
+                    }
+                }
+                if final_byte == 'H' {
+                    let mut parts = params.split(';');
+                    let r: usize = parts.next().and_then(|p| p.parse().ok()).unwrap_or(1);
+                    let cix: usize = parts.next().and_then(|p| p.parse().ok()).unwrap_or(1);
+                    row = r.saturating_sub(1);
+                    col = cix.saturating_sub(1);
+                }
+                continue;
+            }
+            let width = c.width().unwrap_or(0);
+            if row < grid.len() && col < grid[row].len() {
+                grid[row][col] = c;
+            }
+            col += width;
+        }
+    }
+
+    #[test]
+    fn a_new_window_s_flush_fully_covers_a_row_that_held_a_wide_character_underneath() {
+        let output: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let backend = RecordingBackend {
+            width: 40,
+            height: 12,
+            output: output.clone(),
+        };
+        let mut terminal = Terminal::with_backend(Box::new(backend)).unwrap();
+        let mut desktop = Desktop::new(Rect::new(0, 0, 40, 12));
+        let mut grid = vec![vec![' '; 40]; 12];
+
+        // Window A: same bounds every new window gets (no auto-tiling) --
+        // interior content: two blank lines, then the real banner line, so
+        // the banner sits at interior row 2, beyond window B's two lines.
+        let window_bounds = Rect::new(0, 0, 30, 8);
+        let mut window_a = WindowBuilder::new()
+            .bounds(window_bounds)
+            .title("a")
+            .build();
+        let view_a = Rc::new(RefCell::new(StreamView::new(Rect::new(0, 0, 28, 6))));
+        view_a.borrow_mut().push_line(&line(""));
+        view_a.borrow_mut().push_line(&line(""));
+        view_a
+            .borrow_mut()
+            .push_line(&line(&format!("{WRENCH} Reading src/dsml.rs 1:500...")));
+        window_a.add(Box::new(SharedStreamView(view_a)));
+        desktop.add(Box::new(window_a));
+
+        desktop.draw(&mut terminal);
+        terminal.flush().unwrap();
+        replay_onto_grid(&output.lock().unwrap(), &mut grid);
+        output.lock().unwrap().clear();
+
+        // Window B: identical bounds, opens on top, only two short lines of
+        // its own.
+        let mut window_b = WindowBuilder::new()
+            .bounds(window_bounds)
+            .title("b")
+            .build();
+        let view_b = Rc::new(RefCell::new(StreamView::new(Rect::new(0, 0, 28, 6))));
+        view_b.borrow_mut().push_line(&line("hi"));
+        view_b.borrow_mut().push_line(&line("there"));
+        window_b.add(Box::new(SharedStreamView(view_b)));
+        desktop.add(Box::new(window_b));
+
+        desktop.draw(&mut terminal);
+        terminal.flush().unwrap();
+        replay_onto_grid(&output.lock().unwrap(), &mut grid);
+
+        // Interior row 2 (absolute row 1 + 2 = 3, since the window's
+        // interior starts one row inside its own top-left) must be fully
+        // blank in window B: nothing from window A's banner may bleed
+        // through.
+        let absolute_row = usize::try_from(window_bounds.a.y).unwrap() + 1 + 2;
+        let interior_x0 = usize::try_from(window_bounds.a.x).unwrap() + 1;
+        let interior_x1 = usize::try_from(window_bounds.b.x).unwrap() - 1;
+        for col in interior_x0..interior_x1 {
+            assert_eq!(
+                grid[absolute_row][col], ' ',
+                "row {absolute_row} column {col} still shows a leftover \
+                 character from window A: {:?}",
+                grid[absolute_row]
+            );
+        }
+    }
+}
