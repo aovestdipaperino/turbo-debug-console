@@ -29,16 +29,17 @@ const PRESENTATION_SELECTORS: [char; 2] = ['\u{FE0F}', '\u{FE0E}'];
 
 /// Normalizes a naive, one-`Cell`-per-`char` line into one `Cell` per
 /// terminal *column* — the invariant every other method in this module
-/// relies on (row width, the horizontal `left` clip, and `draw`'s column
-/// count).
+/// relies on (row width, wrapping's column-accurate break points, and
+/// `draw`'s column count).
 ///
 /// A double-width character (an emoji, a CJK glyph) keeps its real `char`
 /// in the first cell and gets a filler cell for each additional column,
 /// mirroring `turbo_vision`'s own `DrawBuffer::move_str` convention: the
 /// terminal's cell-diffing flush already knows to skip a `'\0'` when
 /// encoding output, so an invented filler paints as blank if ever exposed
-/// (e.g. a horizontal scroll cutting a wide character in half) rather than
-/// emitting half a glyph. When the second column instead comes from a real
+/// (e.g. wrapping is careful never to cut a wide character in half, but if
+/// it ever did, this is what would be exposed) rather than emitting half a
+/// glyph. When the second column instead comes from a real
 /// trailing presentation selector, that selector's own character is kept
 /// as the filler — it is a genuine, zero-advance character, not a padding
 /// artifact, so `plain_text` must still hand it back on Save As.
@@ -100,20 +101,91 @@ fn normalize_line(cells: &[Cell]) -> Vec<Cell> {
 /// Default scrollback depth.
 pub const DEFAULT_MAX_LINES: usize = 10_000;
 
+/// Splits one width-normalized logical line (one `Cell` per terminal column,
+/// per `normalize_line`'s invariant) into the display rows it wraps to at
+/// `width` columns.
+///
+/// Breaks at the last whitespace cell at or before the width boundary when
+/// one exists in the row being filled; otherwise breaks exactly at `width`.
+/// Because `cells` is already column-normalized, a wrap point chosen this
+/// way always falls on a column boundary and never between a double-width
+/// character's leading cell and its filler, since a filler cell (`ch ==
+/// '\0'`) is never itself whitespace and so is never chosen as, or split
+/// from, a break point ahead of its owner.
+///
+/// An empty line still yields one (empty) row, matching a real terminal:
+/// a blank logical line occupies one blank display row, not zero.
+fn wrap_cells(cells: &[Cell], width: usize) -> Vec<Vec<Cell>> {
+    if width == 0 || cells.is_empty() {
+        return vec![cells.to_vec()];
+    }
+
+    let mut rows = Vec::new();
+    let mut rest = cells;
+    while rest.len() > width {
+        // Search for a break point: the last whitespace cell whose index is
+        // < width, scanning backwards from width - 1. A filler cell ('\0')
+        // is skipped as a candidate break (it is never whitespace) but does
+        // not stop the scan.
+        let mut break_at = None;
+        for i in (0..width).rev() {
+            if rest[i].ch.is_whitespace() {
+                break_at = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = break_at {
+            rows.push(rest[..i].to_vec());
+            rest = &rest[i + 1..]; // drop the whitespace cell itself
+        } else {
+            // A plain character-break cut at `width` could land between a
+            // double-width character's leading cell and its filler ('\0');
+            // if so, pull the cut back one column so the whole glyph moves
+            // to the next row instead of splitting it.
+            let mut cut = width;
+            if cut > 1 && rest.get(cut).is_some_and(|c| c.ch == '\0') {
+                cut -= 1;
+            }
+            rows.push(rest[..cut].to_vec());
+            rest = &rest[cut..];
+        }
+    }
+    rows.push(rest.to_vec());
+    rows
+}
+
 /// A scrollback of styled lines, with autoscroll that releases when the user
 /// scrolls back and re-arms at the bottom.
 #[derive(Debug)]
 pub struct StreamView {
     bounds: Rect,
-    /// Completed lines, oldest first.
+    /// Completed lines, oldest first. This is the source of truth: the log
+    /// text as the producer sent it, one entry per logical line, never
+    /// baked with this window's current wrap points. `plain_text()` reads
+    /// from here, not from `wrapped`.
     lines: Vec<Vec<Cell>>,
     /// The line currently streaming in, not yet terminated by a newline.
     partial: Option<Vec<Cell>>,
+    /// Display rows for `lines`, in order, each logical line's rows
+    /// contiguous. `draw` and all scroll arithmetic read only from here (and
+    /// from `partial_wrapped` below), never from `lines` directly.
+    wrapped: Vec<Vec<Cell>>,
+    /// How many display rows in `wrapped` each entry of `lines` currently
+    /// occupies, parallel to `lines`. Lets `trim` drop exactly the rows a
+    /// dropped logical line contributed without re-wrapping everything.
+    row_counts: Vec<usize>,
+    /// Display rows for the in-progress `partial` line, wrapped the same
+    /// way; kept separate from `wrapped` because `set_partial` replaces
+    /// rather than appends.
+    partial_wrapped: Vec<Vec<Cell>>,
+    /// Bounds by logical lines, not display rows: a narrower window wraps
+    /// the same history into more rows, and bounding by rows would make a
+    /// narrow window silently forget more history than a wide one for the
+    /// same underlying stream. Logical-line count is the stable, resize-
+    /// independent budget.
     max_lines: usize,
-    /// Index of the topmost displayed line.
+    /// Index of the topmost displayed row, in `wrapped`.
     top: usize,
-    /// Horizontal scroll offset, in cells.
-    left: usize,
     /// True while the view follows the tail.
     follow: bool,
     fill: Attr,
@@ -126,12 +198,18 @@ impl StreamView {
             bounds,
             lines: Vec::new(),
             partial: None,
+            wrapped: Vec::new(),
+            row_counts: Vec::new(),
+            partial_wrapped: Vec::new(),
             max_lines: DEFAULT_MAX_LINES,
             top: 0,
-            left: 0,
             follow: true,
             fill: Attr::new(TvColor::LightGray, TvColor::Black),
         }
+    }
+
+    fn width(&self) -> usize {
+        usize::try_from(self.bounds.width()).unwrap_or(0)
     }
 
     pub fn set_max_lines(&mut self, n: usize) {
@@ -141,7 +219,11 @@ impl StreamView {
 
     /// Appends a completed line.
     pub fn push_line(&mut self, cells: &[Cell]) {
-        self.lines.push(normalize_line(cells));
+        let normalized = normalize_line(cells);
+        let rows = wrap_cells(&normalized, self.width());
+        self.row_counts.push(rows.len());
+        self.wrapped.extend(rows);
+        self.lines.push(normalized);
         self.trim();
         if self.follow {
             self.scroll_to_bottom();
@@ -152,7 +234,13 @@ impl StreamView {
     /// still streaming, so it must overwrite rather than append.
     pub fn set_partial(&mut self, cells: &[Cell]) {
         let cells = normalize_line(cells);
-        self.partial = if cells.is_empty() { None } else { Some(cells) };
+        if cells.is_empty() {
+            self.partial = None;
+            self.partial_wrapped.clear();
+        } else {
+            self.partial_wrapped = wrap_cells(&cells, self.width());
+            self.partial = Some(cells);
+        }
         if self.follow {
             self.scroll_to_bottom();
         }
@@ -161,8 +249,10 @@ impl StreamView {
     pub fn clear(&mut self) {
         self.lines.clear();
         self.partial = None;
+        self.wrapped.clear();
+        self.row_counts.clear();
+        self.partial_wrapped.clear();
         self.top = 0;
-        self.left = 0;
         self.follow = true;
     }
 
@@ -172,13 +262,41 @@ impl StreamView {
         self.lines.len() + usize::from(self.partial.is_some())
     }
 
+    /// Total display rows currently shown, including the in-progress line's
+    /// wrapped rows. This is what scroll arithmetic (`page`, `max_top`, and
+    /// the keyboard handlers) counts, so scrolling lands correctly wherever
+    /// a wrapped long line pushes rows out of alignment with logical lines.
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        self.wrapped.len() + self.partial_wrapped.len()
+    }
+
     /// Visible rows, i.e. the view height.
     fn page(&self) -> usize {
         usize::try_from(self.bounds.height()).unwrap_or(0).max(1)
     }
 
     fn max_top(&self) -> usize {
-        self.line_count().saturating_sub(self.page())
+        self.row_count().saturating_sub(self.page())
+    }
+
+    /// Rewraps every logical line and the in-progress partial at the current
+    /// width, rebuilding `wrapped`, `row_counts` and `partial_wrapped` from
+    /// scratch. Needed whenever the width itself changes (a resize), since
+    /// every existing wrap point can be stale in either direction.
+    fn rewrap(&mut self) {
+        let width = self.width();
+        self.wrapped.clear();
+        self.row_counts.clear();
+        for line in &self.lines {
+            let rows = wrap_cells(line, width);
+            self.row_counts.push(rows.len());
+            self.wrapped.extend(rows);
+        }
+        self.partial_wrapped = match &self.partial {
+            Some(cells) => wrap_cells(cells, width),
+            None => Vec::new(),
+        };
     }
 
     pub fn scroll_to_bottom(&mut self) {
@@ -232,11 +350,22 @@ impl StreamView {
         self.lines.iter().chain(self.partial.iter())
     }
 
+    /// Display rows currently on screen or scrolled to, in order: the wrapped
+    /// completed lines followed by the wrapped in-progress line.
+    fn iter_rows(&self) -> impl Iterator<Item = &Vec<Cell>> {
+        self.wrapped.iter().chain(self.partial_wrapped.iter())
+    }
+
+    /// Bounds the scrollback by logical lines (see `max_lines`'s doc
+    /// comment), dropping the oldest ones and exactly the display rows they
+    /// contributed to `wrapped`.
     fn trim(&mut self) {
         if self.lines.len() > self.max_lines {
             let drop = self.lines.len() - self.max_lines;
             self.lines.drain(..drop);
-            self.top = self.top.saturating_sub(drop);
+            let dropped_rows: usize = self.row_counts.drain(..drop).sum();
+            self.wrapped.drain(..dropped_rows);
+            self.top = self.top.saturating_sub(dropped_rows);
         }
     }
 }
@@ -247,7 +376,11 @@ impl View for StreamView {
     }
 
     fn set_bounds(&mut self, bounds: Rect) {
+        let width_changed = self.width() != usize::try_from(bounds.width()).unwrap_or(0);
         self.bounds = bounds;
+        if width_changed {
+            self.rewrap();
+        }
         if self.follow {
             self.scroll_to_bottom();
         } else {
@@ -261,15 +394,15 @@ impl View for StreamView {
         }
         let width = usize::try_from(self.bounds.width()).unwrap_or(0);
         let page = self.page();
-        let lines: Vec<&Vec<Cell>> = self.iter_lines().skip(self.top).take(page).collect();
+        let rows: Vec<&Vec<Cell>> = self.iter_rows().skip(self.top).take(page).collect();
 
         for row in 0..page {
             let mut buf = DrawBuffer::new(width);
             for i in 0..width {
                 buf.put_char(i, ' ', self.fill);
             }
-            if let Some(line) = lines.get(row) {
-                for (i, cell) in line.iter().skip(self.left).take(width).enumerate() {
+            if let Some(line) = rows.get(row) {
+                for (i, cell) in line.iter().take(width).enumerate() {
                     buf.put_char(i, cell.ch, cell.attr);
                 }
             }
@@ -574,27 +707,25 @@ mod tests {
             v.top,
             v.max_top()
         );
-        let lines: Vec<&Vec<Cell>> = v.iter_lines().skip(v.top).take(v.page()).collect();
+        let rows: Vec<&Vec<Cell>> = v.iter_rows().skip(v.top).take(v.page()).collect();
         assert_eq!(
-            lines.len(),
-            v.page().min(v.line_count()),
+            rows.len(),
+            v.page().min(v.row_count()),
             "a full page of content should be visible after growing"
         );
     }
 
     #[test]
-    fn draw_clips_to_bounds_and_applies_horizontal_offset() {
+    fn draw_clips_to_bounds_width() {
         let mut v = StreamView::new(Rect::new(2, 1, 8, 4));
-        v.push_line(&line("abcdefghij")); // longer than the 6-wide view
         v.push_line(&line("short")); // shorter than the 6-wide view
-        v.left = 2; // horizontal scroll offset
 
         let mut terminal = fake_terminal(20, 10);
         v.draw(&mut terminal);
 
-        // Row 0 (bounds.a.y == 1): "abcdefghij" skipped by `left` 2, then
-        // clipped to width 6, drawn starting at bounds.a.x == 2.
-        for (i, expected) in "cdefgh".chars().enumerate() {
+        // Row 0 (bounds.a.y == 1): "short", padded with the fill space for
+        // the remaining column.
+        for (i, expected) in "short ".chars().enumerate() {
             let cell = terminal
                 .read_cell(2 + i16::try_from(i).unwrap_or(i16::MAX), 1)
                 .expect("cell within terminal bounds");
@@ -603,16 +734,7 @@ mod tests {
         // Nothing is drawn past the view's width (x == 8 is out of bounds).
         assert_eq!(terminal.read_cell(8, 1).unwrap().ch, ' ');
 
-        // Row 1 (bounds.a.y == 2): "short" skipped by `left` 2 -> "ort",
-        // padded with the fill space for the remaining 3 columns.
-        for (i, expected) in "ort   ".chars().enumerate() {
-            let cell = terminal
-                .read_cell(2 + i16::try_from(i).unwrap_or(i16::MAX), 2)
-                .expect("cell within terminal bounds");
-            assert_eq!(cell.ch, expected);
-        }
-
-        // Nothing above or below the view's rows was touched.
+        // Nothing above the view's rows was touched.
         assert_eq!(terminal.read_cell(2, 0).unwrap().ch, ' ');
     }
 
@@ -693,29 +815,32 @@ mod tests {
     }
 
     #[test]
-    fn horizontal_offset_clips_correctly_when_a_wide_character_straddles_the_cut() {
-        let mut v = StreamView::new(Rect::new(0, 0, 6, 4));
-        v.push_line(&line(&format!("ab{WRENCH}cd"))); // columns: a b [wrench] [spacer] c d
-        v.left = 2; // skip "ab", landing on the wrench's first column
+    fn a_double_width_character_straddling_a_wrap_boundary_is_never_split() {
+        // Columns: a b [中 col0] [中 col1: a '\0' filler cell] c d -- 6
+        // columns, wrapped at width 3. A naive character-break cut at column
+        // 3 would land squarely on the filler cell, splitting the glyph in
+        // half; the wrap must instead push the whole character to the next
+        // row.
+        let mut v = StreamView::new(Rect::new(0, 0, 3, 4));
+        v.push_line(&line("ab中cd"));
+
+        assert_eq!(v.row_count(), 3, "the 6-column line wraps to three rows");
+
         let mut terminal = fake_terminal(20, 10);
         v.draw(&mut terminal);
 
-        assert_eq!(terminal.read_cell(0, 0).unwrap().ch, '\u{1F6E0}');
-        assert_eq!(terminal.read_cell(1, 0).unwrap().ch, '\u{FE0F}');
-        assert_eq!(terminal.read_cell(2, 0).unwrap().ch, 'c');
-        assert_eq!(terminal.read_cell(3, 0).unwrap().ch, 'd');
+        // Row 0 holds only "ab": the wide character was pushed whole to the
+        // next row rather than being split across the boundary.
+        assert_eq!(terminal.read_cell(0, 0).unwrap().ch, 'a');
+        assert_eq!(terminal.read_cell(1, 0).unwrap().ch, 'b');
 
-        // Now offset by 3, landing squarely on the spacer half of the
-        // wrench: only the lone selector character (zero-advance-width in
-        // any real terminal, so it paints as blank on its own) shows at
-        // column 0, never half a glyph, and everything after it must still
-        // be at its true column.
-        v.left = 3;
-        let mut terminal2 = fake_terminal(20, 10);
-        v.draw(&mut terminal2);
-        assert_eq!(terminal2.read_cell(0, 0).unwrap().ch, '\u{FE0F}');
-        assert_eq!(terminal2.read_cell(1, 0).unwrap().ch, 'c');
-        assert_eq!(terminal2.read_cell(2, 0).unwrap().ch, 'd');
+        // Row 1 holds the wide character (both its columns) followed by "c".
+        assert_eq!(terminal.read_cell(0, 1).unwrap().ch, '中');
+        assert_eq!(terminal.read_cell(1, 1).unwrap().ch, '\0');
+        assert_eq!(terminal.read_cell(2, 1).unwrap().ch, 'c');
+
+        // Row 2 holds the remaining "d".
+        assert_eq!(terminal.read_cell(0, 2).unwrap().ch, 'd');
     }
 
     #[test]
@@ -769,6 +894,124 @@ mod tests {
                  the window underneath: {grid:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_line_longer_than_the_width_wraps_across_the_right_number_of_rows_with_complete_content() {
+        let mut v = StreamView::new(Rect::new(0, 0, 10, 20));
+        // 25 non-space characters at width 10 -> ceil(25/10) = 3 rows.
+        let text = "abcdefghijklmnopqrstuvwxy";
+        v.push_line(&line(text));
+
+        assert_eq!(v.row_count(), 3);
+        assert_eq!(
+            v.plain_text(),
+            text,
+            "wrapping must not drop or duplicate any character"
+        );
+
+        // Also verify via the rendered rows that content is complete and in
+        // order across them.
+        let mut terminal = fake_terminal(20, 20);
+        v.draw(&mut terminal);
+        let mut rendered = String::new();
+        for row in 0..3 {
+            for col in 0..10 {
+                rendered.push(terminal.read_cell(col, row).unwrap().ch);
+            }
+        }
+        assert_eq!(rendered, "abcdefghijklmnopqrstuvwxy     ");
+    }
+
+    #[test]
+    fn a_wrap_breaks_at_a_space_rather_than_mid_word_when_one_is_available() {
+        let mut v = StreamView::new(Rect::new(0, 0, 10, 20));
+        v.push_line(&line("hello world"));
+
+        // "hello world" is 11 columns wide; wrapping at 10 without a
+        // space-aware break would cut mid-word ("hello worl" / "d"). The
+        // break must instead land on the space, dropping it, and produce
+        // "hello" / "world".
+        assert_eq!(v.row_count(), 2);
+        let mut terminal = fake_terminal(20, 20);
+        v.draw(&mut terminal);
+        for (i, expected) in "hello     ".chars().enumerate() {
+            assert_eq!(
+                terminal.read_cell(i16::try_from(i).unwrap(), 0).unwrap().ch,
+                expected
+            );
+        }
+        for (i, expected) in "world     ".chars().enumerate() {
+            assert_eq!(
+                terminal.read_cell(i16::try_from(i).unwrap(), 1).unwrap().ch,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_token_longer_than_the_width_is_broken_rather_than_truncated() {
+        let mut v = StreamView::new(Rect::new(0, 0, 5, 20));
+        // A 12-character token with no whitespace at all -- a long path,
+        // say -- must still be fully visible, broken mid-token instead of
+        // truncated.
+        v.push_line(&line("abcdefghijkl"));
+
+        assert_eq!(v.row_count(), 3); // ceil(12/5) = 3
+        assert_eq!(
+            v.plain_text(),
+            "abcdefghijkl",
+            "the logical text is preserved even though it had to be broken mid-token"
+        );
+    }
+
+    #[test]
+    fn plain_text_returns_the_original_unwrapped_logical_lines() {
+        let mut v = StreamView::new(Rect::new(0, 0, 5, 20));
+        v.push_line(&line("a much longer line than the five-column view"));
+        v.push_line(&line("short"));
+
+        assert_eq!(
+            v.plain_text(),
+            "a much longer line than the five-column view\nshort",
+            "Save As must get the original logical lines, not this window's wrap points"
+        );
+    }
+
+    #[test]
+    fn resizing_narrower_then_wider_rewraps_and_content_survives_both() {
+        let mut v = StreamView::new(Rect::new(0, 0, 20, 20));
+        let text = "abcdefghijklmnopqrstuvwxyz";
+        v.push_line(&line(text));
+        assert_eq!(v.row_count(), 2); // ceil(26/20)
+
+        v.set_bounds(Rect::new(0, 0, 5, 20));
+        assert_eq!(v.row_count(), 6); // ceil(26/5)
+        assert_eq!(v.plain_text(), text);
+
+        v.set_bounds(Rect::new(0, 0, 30, 20));
+        assert_eq!(v.row_count(), 1); // fits on one row now
+        assert_eq!(v.plain_text(), text);
+    }
+
+    #[test]
+    fn scrolling_by_page_lands_correctly_when_wrapped_rows_are_present() {
+        // One long line that wraps to 20 rows, in a 5-row-tall view.
+        let mut v = StreamView::new(Rect::new(0, 0, 4, 5));
+        let text: String = (0..80).map(|i| char::from(b'a' + (i % 26))).collect();
+        v.push_line(&line(&text));
+        assert_eq!(v.row_count(), 20);
+
+        v.scroll_to_top();
+        assert_eq!(v.top, 0);
+        v.scroll_down(v.page()); // one page down: page() == 5
+        assert_eq!(
+            v.top, 5,
+            "paging must move by display rows, not logical lines"
+        );
+
+        v.scroll_to_bottom();
+        assert_eq!(v.top, v.row_count() - v.page());
     }
 
     #[test]

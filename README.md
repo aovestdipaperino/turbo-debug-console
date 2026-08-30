@@ -118,8 +118,10 @@ verbatim rather than dropped.
 | `Alt-X` | quit |
 | `PgUp` / `PgDn` / `Home` / `End` | scroll the focused window |
 
-Scrolling back releases autoscroll; `End` re-arms it, so a window you are
-reading does not yank itself to the bottom when new output arrives.
+Long lines wrap to the window's width rather than being cut off, so there is
+nothing to scroll horizontally to; scrolling is vertical only, by display
+row. Scrolling back releases autoscroll; `End` re-arms it, so a window you
+are reading does not yank itself to the bottom when new output arrives.
 
 **File** opens a saved capture into a new window, or writes the focused
 window's transcript out as plain text. **View** clears a window; thinking
