@@ -5,7 +5,7 @@
 
 use turbo_vision::core::ansi::AnsiParser;
 use turbo_vision::core::draw::Cell;
-use turbo_vision::core::palette::{Attr, TvColor};
+use turbo_vision::core::palette::{Attr, Style, TvColor};
 
 /// `\r\x1b[0K` — cursor to column 0, erase to end of line. `trace_stream`
 /// emits exactly this byte sequence when it repaints a fenced code block's
@@ -52,17 +52,37 @@ pub fn attr_to_sgr(attr: Attr) -> String {
             other => format!("\x1b[{kind};5;{}m", ansi256_index(other)),
         }
     }
-    format!("{}{}", one(38, attr.fg), one(48, attr.bg))
+    // Re-emit the text styles too, so a bold/italic/underline run that spans a
+    // line break keeps its style once `carry` is re-parsed. `AnsiParser` reads
+    // the SGR digits directly (1 bold, 2 dim, 3 italic, 4 underline, 7 reverse,
+    // 9 strikethrough); a fresh `parse_line` starts from an empty style, so
+    // anything not restated here is lost.
+    use std::fmt::Write as _;
+    let mut style = String::new();
+    for (flag, code) in [
+        (Style::BOLD, 1),
+        (Style::DIM, 2),
+        (Style::ITALIC, 3),
+        (Style::UNDERLINE, 4),
+        (Style::REVERSE, 7),
+        (Style::STRIKETHROUGH, 9),
+    ] {
+        if attr.style.contains(flag) {
+            let _ = write!(style, "\x1b[{code}m");
+        }
+    }
+    format!("{}{}{}", one(38, attr.fg), one(48, attr.bg), style)
 }
 
 /// Feeds a byte stream into `AnsiParser` one line at a time, carrying SGR
 /// state across line breaks and holding back incomplete input.
 ///
-/// Deliberate limits, not bugs to fix: `Attr` carries only `fg` and `bg`, so
-/// ANSI bold becomes a brighter foreground (that is what `AnsiParser`
-/// already does) and italic is dropped entirely — plank's dim-italic
-/// thinking style arrives as its 256-color grey with the italic lost.
-/// Turbo Vision cells have no italic attribute. Also deliberate: the
+/// Since turbo-vision 2.2, `Attr` carries a `style` bitset alongside `fg`/`bg`,
+/// so ANSI bold, dim, italic, underline, reverse, and strikethrough survive
+/// parsing and are re-emitted by [`attr_to_sgr`] to carry across line breaks —
+/// plank's dim-italic thinking style now arrives italic, not just as its grey.
+/// (ANSI bold still also brightens the foreground; that is `AnsiParser`'s own
+/// behavior.) Deliberate, not a bug: the
 /// `ERASE_LINE` repaint marker (`\r\x1b[0K`) is detected as a literal
 /// 4-byte match anywhere it appears in `pending`, with no surrounding
 /// context check. Content that happens to quote that exact byte sequence
@@ -239,6 +259,25 @@ mod tests {
             partial[0].attr.fg,
             TvColor::Red,
             "SGR state must survive the newline"
+        );
+    }
+
+    #[test]
+    fn text_style_carries_across_a_line_break() {
+        use turbo_vision::core::palette::Style;
+        let mut a = AnsiLineAssembler::new();
+        // Bold + italic opened on line one, no reset before the newline.
+        a.push(b"\x1b[1;3mstyled one\nstill styled");
+        let lines = a.take_complete_lines();
+        assert!(lines[0].last().unwrap().attr.style.contains(Style::BOLD));
+        let partial = a.partial_line();
+        assert!(
+            partial[0].attr.style.contains(Style::BOLD),
+            "bold must survive the newline"
+        );
+        assert!(
+            partial[0].attr.style.contains(Style::ITALIC),
+            "italic must survive the newline"
         );
     }
 

@@ -212,6 +212,27 @@ mod tests {
     }
 
     #[test]
+    fn code_keywords_render_bold_and_comments_italic() {
+        use turbo_vision::core::palette::Style;
+        let mut p = Pipeline::new(opts());
+        let mut v = StreamView::new(Rect::new(0, 0, 80, 24));
+        p.feed(b"```rust\nfn main() {} // note\n```\n", &mut v);
+        p.finish(&mut v);
+        let cells: Vec<_> = v.styled_lines().into_iter().flatten().collect();
+        // The `fn` keyword: bold.
+        let f = cells
+            .iter()
+            .find(|c| c.ch == 'f')
+            .expect("keyword letter present");
+        assert!(f.attr.style.contains(Style::BOLD), "keyword must be bold");
+        // The comment text: italic.
+        let note = cells
+            .iter()
+            .find(|c| c.ch == 'n' && c.attr.style.contains(Style::ITALIC));
+        assert!(note.is_some(), "comment must be italic");
+    }
+
+    #[test]
     fn split_delivery_matches_whole_delivery() {
         let input = b"# Title\n\nsome **bold** text\n";
         let mut whole_p = Pipeline::new(opts());

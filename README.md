@@ -144,9 +144,11 @@ renderer the [plank](https://github.com/aovestdipaperino/plank) agent uses for
 its own terminal output — over a `Vec<u8>`, and converts the ANSI it emits into
 Turbo Vision cells. Same state machine, so the two cannot drift.
 
-Two deliberate losses, because Turbo Vision cells carry only a foreground and a
-background colour: ANSI **bold** becomes a brighter foreground, and *italic* is
-dropped. Dimmed thinking text keeps its colour and loses its slant.
+Text styles come through, not just colour. Since Turbo Vision 2.2 a cell
+carries a style bitset alongside its colours, so ANSI **bold**, *italic* and
+underline survive: keyword highlighting renders bold, comments italic, and
+dimmed thinking text keeps its slant. Bold on an explicitly-chosen colour
+keeps that colour's hue rather than brightening it.
 
 ## Build from source
 
