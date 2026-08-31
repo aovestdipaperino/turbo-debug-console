@@ -132,9 +132,20 @@ plain click, `Esc`, or new output on that window clears it.
 
 **File** opens a saved capture into a new window, or writes the focused
 window's transcript out as plain text. **Edit** copies the current selection
-to the clipboard (disabled until something is selected), selects the whole
-window, and clears a window; thinking text and markdown rendering are always
-on, not toggles. **Window** tiles, cascades and cycles.
+to the clipboard, selects the whole window, and clears a window; thinking
+text and markdown rendering are always on, not toggles. **Window** cycles,
+tiles and cascades, and **Cleanup** closes every window whose client has gone
+away — the ones whose titles read `[disconnected]` — in one go. That is worth
+having because a new window covers the whole desktop, so older windows sit
+hidden behind the newest one; Cleanup sweeps the dead ones without hunting
+through the stack. Closing a window also tears its session down, releasing
+the port.
+
+Menu items grey out when they have nothing to act on: Copy until something is
+selected, Save As / Select All / Clear window until a window is focused,
+Cleanup until a window has actually lost its client, and Next / Tile / Cascade
+until there is more than one window. There is no Window > Close item — a
+window closes from the close box on its own frame.
 
 ## How it renders
 

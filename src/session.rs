@@ -174,6 +174,14 @@ impl Sessions {
         );
     }
 
+    /// Whether a session currently has a client attached. Unknown ids read
+    /// as disconnected, which is what Window > Cleanup wants: a window whose
+    /// session is already gone is exactly a window to sweep away.
+    #[must_use]
+    pub fn is_connected(&self, id: SessionId) -> bool {
+        self.inner.get(&id).is_some_and(|s| s.connected)
+    }
+
     pub fn get_mut(&mut self, id: SessionId) -> Option<&mut SessionState> {
         self.inner.get_mut(&id)
     }
@@ -240,7 +248,9 @@ impl Sessions {
     /// One session's currently selected text, if any (Edit > Copy).
     #[must_use]
     pub fn selected_text(&self, id: SessionId) -> Option<String> {
-        self.inner.get(&id).and_then(|s| s.view.borrow().selected_text())
+        self.inner
+            .get(&id)
+            .and_then(|s| s.view.borrow().selected_text())
     }
 
     /// The title a session's window should currently show, for reflecting

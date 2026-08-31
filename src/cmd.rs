@@ -18,3 +18,17 @@ pub const CM_CLEAR_WINDOW: CommandId = 1004;
 pub const CM_COPY: CommandId = 1002;
 /// Edit > Select All (selects the whole scrollback)
 pub const CM_SELECT_ALL: CommandId = 1003;
+/// Window > Cleanup (closes every disconnected window)
+pub const CM_CLEANUP: CommandId = 1005;
+/// Window > Tile (an app-owned id — see `CM_CASCADE_WINDOWS`)
+pub const CM_TILE_WINDOWS: CommandId = 1006;
+/// Window > Cascade.
+///
+/// Deliberately *not* Turbo Vision's own `CM_TILE` / `CM_CASCADE`:
+/// `Application::idle()` re-enables those two ids whenever the desktop holds
+/// any tileable window at all, and it runs inside `Application::get_event`
+/// on every poll timeout — so an app-level "only with more than one window"
+/// rule applied to the library ids is overwritten milliseconds later. These
+/// ids are ours alone; nothing else touches their enabled state, and
+/// `Console::handle_command` maps them onto `Application::tile` / `cascade`.
+pub const CM_CASCADE_WINDOWS: CommandId = 1007;

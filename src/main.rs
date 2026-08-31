@@ -15,7 +15,7 @@ use turbo_debug_console::registry::{Server, ServerEvent, SessionId};
 use turbo_debug_console::session::{Sessions, SharedStreamView, format_title};
 use turbo_debug_console::streamview::StreamView;
 use turbo_vision::app::Application;
-use turbo_vision::core::command::{CM_CASCADE, CM_CLOSE, CM_NEXT, CM_QUIT, CM_TILE};
+use turbo_vision::core::command::{CM_NEXT, CM_QUIT};
 use turbo_vision::core::event::{EventType, KB_ALT_X, KB_F6, KB_F10};
 use turbo_vision::core::geometry::Rect;
 use turbo_vision::core::menu_data::{Menu, MenuItem};
@@ -99,8 +99,20 @@ fn handle_cli_flags() {
     }
 }
 
+/// Sets the host terminal's window/tab title (OSC 2). Written straight to
+/// stdout before the UI comes up: turbo-vision has no title API of its own,
+/// and the escape is inert on terminals that do not understand it.
+fn set_terminal_title(title: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b]2;{title}\x07");
+    let _ = out.flush();
+}
+
 fn main() -> turbo_vision::core::error::Result<()> {
     handle_cli_flags();
+
+    set_terminal_title("Turbo Debug Console");
 
     let mut app = Application::new()?;
     let (width, height) = app.terminal.size();
@@ -120,9 +132,18 @@ fn main() -> turbo_vision::core::error::Result<()> {
 
     let mut console = Console::default();
 
-    // Copy starts disabled: nothing is selected yet. `sync_command_state`
-    // keeps it in step from here on.
-    app.disable_command(cmd::CM_COPY);
+    // The window-dependent commands all start disabled: there is no window
+    // and nothing selected yet. `sync_command_state` keeps them in step from
+    // here on.
+    for command in [
+        cmd::CM_COPY,
+        cmd::CM_SAVE_AS,
+        cmd::CM_SELECT_ALL,
+        cmd::CM_CLEAR_WINDOW,
+        cmd::CM_CLEANUP,
+    ] {
+        app.disable_command(command);
+    }
 
     app.draw();
     let _ = app.terminal.flush();
@@ -134,6 +155,14 @@ fn main() -> turbo_vision::core::error::Result<()> {
         let mut dirty = false;
 
         if let Some(mut event) = app.get_event() {
+            // Re-assert the command state *before* the event is handled.
+            // `get_event` calls `Application::idle()` internally on every
+            // poll timeout, and `idle()` re-enables `CM_TILE` / `CM_CASCADE`
+            // whenever the desktop holds *any* tileable window — clobbering
+            // the stricter "more than one window" rule below. Syncing only
+            // before `draw` is too late: a menu dropdown is painted inside
+            // `handle_event`, so it would show the clobbered state.
+            console.sync_command_state(&mut app);
             app.handle_event(&mut event);
             dirty = true;
             if event.what == EventType::Command {
@@ -254,7 +283,30 @@ impl Console {
                 }
             }
             cmd::CM_OPEN_CAPTURE => self.open_capture(app),
+            cmd::CM_CLEANUP => self.cleanup_windows(app),
+            cmd::CM_TILE_WINDOWS => app.tile(),
+            cmd::CM_CASCADE_WINDOWS => app.cascade(),
             _ => {}
+        }
+    }
+
+    /// Window > Cleanup: closes every window whose session no longer has a
+    /// client attached, leaving the live ones alone. The windows are only
+    /// flagged `SF_CLOSED` here; the main loop's existing
+    /// `remove_closed_windows` sweep removes them and
+    /// [`Self::forget_closed_windows`] drops the bookkeeping, so this takes
+    /// exactly the same path as a user closing each window by hand.
+    fn cleanup_windows(&mut self, app: &mut Application) {
+        let stale: Vec<ViewId> = self
+            .window_ids
+            .iter()
+            .filter(|(_, id)| !self.sessions.is_connected(**id))
+            .map(|(view_id, _)| *view_id)
+            .collect();
+        for view_id in stale {
+            if let Some(view) = app.desktop.child_by_id_mut(view_id) {
+                view.set_state_flag(SF_CLOSED, true);
+            }
         }
     }
 
@@ -283,8 +335,19 @@ impl Console {
             .is_some_and(|t| !t.is_empty())
     }
 
-    /// Keeps `CM_COPY` enabled only while the focused window has a selection,
-    /// so the menu item greys out otherwise. Cheap enough to call each frame.
+    /// Whether any tracked window's session is disconnected — the exact
+    /// condition [`Self::cleanup_windows`] needs something to do.
+    fn has_stale_windows(&self) -> bool {
+        self.window_ids
+            .values()
+            .any(|id| !self.sessions.is_connected(*id))
+    }
+
+    /// Greys out every menu item that needs something to act on: `CM_COPY`
+    /// unless the focused window has a selection, the focused-window
+    /// commands unless there *is* a focused stream window, and `CM_CLEANUP`
+    /// unless at least one window is disconnected. Cheap enough to call each
+    /// frame.
     fn sync_command_state(&self, app: &mut Application) {
         let focused_id = app
             .desktop
@@ -294,6 +357,31 @@ impl Console {
             app.enable_command(cmd::CM_COPY);
         } else {
             app.disable_command(cmd::CM_COPY);
+        }
+        // Next / Tile / Cascade only mean something with more than one
+        // window. `CM_NEXT` is safe to drive directly, but Tile and Cascade
+        // use this crate's own command ids: Turbo Vision's `idle()` owns the
+        // enabled state of its `CM_TILE` / `CM_CASCADE` and re-enables them
+        // for any window count >= 1 (see `cmd::CM_CASCADE_WINDOWS`).
+        let multiple_windows = app.desktop.count_tileable_windows() > 1;
+        for command in [CM_NEXT, cmd::CM_TILE_WINDOWS, cmd::CM_CASCADE_WINDOWS] {
+            if multiple_windows {
+                app.enable_command(command);
+            } else {
+                app.disable_command(command);
+            }
+        }
+        for command in [cmd::CM_SAVE_AS, cmd::CM_SELECT_ALL, cmd::CM_CLEAR_WINDOW] {
+            if focused_id.is_some() {
+                app.enable_command(command);
+            } else {
+                app.disable_command(command);
+            }
+        }
+        if self.has_stale_windows() {
+            app.enable_command(cmd::CM_CLEANUP);
+        } else {
+            app.disable_command(cmd::CM_CLEANUP);
         }
     }
 
@@ -383,10 +471,21 @@ impl Console {
                     Rc::clone(&view),
                     RENDER_OPTIONS,
                 );
-                let title = match kind {
-                    StreamKind::Tokens => format_title(&name, port),
-                    StreamKind::Trace => format!("[trace] {}", format_title(&name, port)),
-                };
+                // Title the window from the session itself rather than from
+                // `format_title` alone. A session is created on `Opened` —
+                // the HELLO handshake — and only becomes connected later,
+                // when the client dials the data port, which it may never
+                // do. Building the title here from `name`/`port` only made
+                // such a window look attached while `connected` was still
+                // false: the window carried no `[disconnected]` marker, yet
+                // Window > Cleanup (rightly) counted it as one to sweep, so
+                // Cleanup appeared enabled with nothing visibly
+                // disconnected on screen. Asking the session for its own
+                // title keeps the two in step from the first frame.
+                let title = self
+                    .sessions
+                    .window_title(id)
+                    .unwrap_or_else(|| format_title(&name, port));
                 let mut window = WindowBuilder::new()
                     .bounds(window_bounds)
                     .title(title)
@@ -589,9 +688,10 @@ fn build_menu_bar(width: i16) -> MenuBar {
         "~W~indow",
         Menu::from_items(vec![
             MenuItem::new("~N~ext", CM_NEXT, 0, 0),
-            MenuItem::new("~T~ile", CM_TILE, 0, 0),
-            MenuItem::new("C~a~scade", CM_CASCADE, 0, 0),
-            MenuItem::new("~C~lose", CM_CLOSE, 0, 0),
+            MenuItem::new("~T~ile", cmd::CM_TILE_WINDOWS, 0, 0),
+            MenuItem::new("C~a~scade", cmd::CM_CASCADE_WINDOWS, 0, 0),
+            MenuItem::separator(),
+            MenuItem::new("Clean~u~p", cmd::CM_CLEANUP, 0, 0),
         ]),
     ));
 
@@ -647,6 +747,47 @@ static NEXT_CAPTURE_ID: std::sync::atomic::AtomicU64 =
 mod console_decision_tests {
     use super::*;
     use turbo_debug_console::registry::ServerEvent;
+
+    /// Window > Cleanup lights up from `Sessions::is_connected`, the same
+    /// state a window title reports as `[disconnected]`. A session is
+    /// disconnected from the moment it is created (the HELLO) until its
+    /// client dials the data port, so a freshly `Opened` session counts as
+    /// stale, `Attached` clears it, and `Disconnected` brings it back.
+    /// (`has_stale_windows` itself needs real `ViewId`s, which only a live
+    /// desktop can mint, so this pins the decision it reads.)
+    #[test]
+    fn cleanup_availability_follows_the_session_connect_state() {
+        let mut console = Console::default();
+        // `decide_server_event` leaves session creation to `apply_intent`
+        // (it needs a desktop); register the session the same way.
+        console.sessions.insert(
+            1,
+            "demo".into(),
+            61278,
+            StreamKind::Tokens,
+            Rc::new(RefCell::new(StreamView::new(Rect::new(0, 0, 20, 5)))),
+            RENDER_OPTIONS,
+        );
+        assert!(
+            !console.sessions.is_connected(1),
+            "a session whose client has not attached yet is a cleanup candidate"
+        );
+
+        console.decide_server_event(ServerEvent::Attached {
+            id: 1,
+            reattached: false,
+        });
+        assert!(
+            console.sessions.is_connected(1),
+            "an attached session is not a cleanup candidate"
+        );
+
+        console.decide_server_event(ServerEvent::Disconnected { id: 1 });
+        assert!(
+            !console.sessions.is_connected(1),
+            "a session whose client went away is a cleanup candidate again"
+        );
+    }
 
     #[test]
     fn opened_decides_to_create_a_window() {
