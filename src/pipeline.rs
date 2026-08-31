@@ -232,6 +232,37 @@ mod tests {
         assert!(note.is_some(), "comment must be italic");
     }
 
+    /// A console window lives for a whole session, so its renderer outlives
+    /// any one generation pass. trace-stream used to freeze all output after a
+    /// DSML error, which is right for a per-pass renderer and fatal here: the
+    /// window went dead at the first bad stanza and showed nothing for the
+    /// rest of the session, while plank itself recovered and carried on.
+    /// Fixed in trace-stream 0.1.2, where freezing became opt-in and this
+    /// pipeline (correctly) does not opt in.
+    #[test]
+    fn a_dsml_error_does_not_kill_the_window_for_the_rest_of_the_session() {
+        let mut p = Pipeline::new(opts());
+        let mut v = StreamView::new(Rect::new(0, 0, 80, 24));
+        p.feed("junk \u{ff5c}DSML\u{ff5c} junk".as_bytes(), &mut v);
+        // A later pass over the same connection.
+        p.feed(b"Here is the corrected answer.", &mut v);
+        p.finish(&mut v);
+
+        let text = v
+            .styled_lines()
+            .iter()
+            .flat_map(|l| l.iter().map(|c| c.ch))
+            .collect::<String>();
+        assert!(
+            text.contains("invalid tool call"),
+            "the error must still be reported: {text:?}"
+        );
+        assert!(
+            text.contains("Here is the corrected answer."),
+            "output after the error must still render: {text:?}"
+        );
+    }
+
     #[test]
     fn split_delivery_matches_whole_delivery() {
         let input = b"# Title\n\nsome **bold** text\n";
