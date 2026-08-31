@@ -117,16 +117,24 @@ verbatim rather than dropped.
 | `F6` | next window |
 | `Alt-X` | quit |
 | `PgUp` / `PgDn` / `Home` / `End` | scroll the focused window |
+| drag (left mouse) | select text in the focused window |
+| `Esc` | clear the selection |
 
 Long lines wrap to the window's width rather than being cut off, so there is
 nothing to scroll horizontally to; scrolling is vertical only, by display
 row. Scrolling back releases autoscroll; `End` re-arms it, so a window you
 are reading does not yank itself to the bottom when new output arrives.
 
+Drag with the left mouse button to select text; the selection follows the
+mouse and survives scrolling. A selection spanning wrapped lines copies back
+as the original logical lines — a soft wrap does not become a newline. A
+plain click, `Esc`, or new output on that window clears it.
+
 **File** opens a saved capture into a new window, or writes the focused
-window's transcript out as plain text. **View** clears a window; thinking
-text and markdown rendering are always on, not toggles. **Window** tiles,
-cascades and cycles.
+window's transcript out as plain text. **Edit** copies the current selection
+to the clipboard (disabled until something is selected), selects the whole
+window, and clears a window; thinking text and markdown rendering are always
+on, not toggles. **Window** tiles, cascades and cycles.
 
 ## How it renders
 

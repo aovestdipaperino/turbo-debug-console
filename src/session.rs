@@ -230,6 +230,19 @@ impl Sessions {
         self.inner.get(&id).map(|s| s.view.borrow().plain_text())
     }
 
+    /// Selects a session's whole scrollback (Edit > Select All).
+    pub fn select_all(&mut self, id: SessionId) {
+        if let Some(s) = self.inner.get_mut(&id) {
+            s.view.borrow_mut().select_all();
+        }
+    }
+
+    /// One session's currently selected text, if any (Edit > Copy).
+    #[must_use]
+    pub fn selected_text(&self, id: SessionId) -> Option<String> {
+        self.inner.get(&id).and_then(|s| s.view.borrow().selected_text())
+    }
+
     /// The title a session's window should currently show, for reflecting
     /// connect/disconnect state after the fact (the window itself is not
     /// reachable from here — the caller owns the desktop).

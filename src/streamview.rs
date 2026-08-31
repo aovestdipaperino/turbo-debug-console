@@ -7,13 +7,45 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use turbo_vision::core::draw::{Cell, DrawBuffer};
 use turbo_vision::core::event::{
-    Event, EventType, KB_DOWN, KB_END, KB_HOME, KB_PGDN, KB_PGUP, KB_UP,
+    Event, EventType, KB_DOWN, KB_END, KB_ESC, KB_HOME, KB_PGDN, KB_PGUP, KB_UP, MB_LEFT_BUTTON,
 };
-use turbo_vision::core::geometry::Rect;
+use turbo_vision::core::geometry::{Point, Rect};
 use turbo_vision::core::palette::{Attr, TvColor};
 use turbo_vision::core::state::{GF_GROW_HI_X, GF_GROW_HI_Y, GrowFlags};
 use turbo_vision::terminal::Terminal;
 use turbo_vision::views::view::{View, write_line_to_terminal};
+
+/// A caret position in the wrapped scrollback: an absolute display-row index
+/// (into `iter_rows()`, so it survives scrolling) and a column, where the
+/// column is a cell index in that row (`draw` maps cell index 1:1 to screen
+/// column). A caret at `col` sits just before the cell at `col`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct SelPos {
+    row: usize,
+    col: usize,
+}
+
+/// An active (continuous) selection between two carets.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Selection {
+    anchor: SelPos,
+    head: SelPos,
+}
+
+/// Swaps foreground and background, preserving text style — the highlight for
+/// a selected cell.
+fn reverse(attr: Attr) -> Attr {
+    Attr::new(attr.bg, attr.fg).with_style(attr.style)
+}
+
+/// The two carets in reading order (top-to-bottom, left-to-right).
+fn order(a: SelPos, b: SelPos) -> (SelPos, SelPos) {
+    if (a.row, a.col) <= (b.row, b.col) {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
 
 /// A base character immediately followed by U+FE0F (the emoji presentation
 /// selector, VS-16) or U+FE0E (the text presentation selector, VS-15) forms
@@ -198,6 +230,10 @@ pub struct StreamView {
     /// True while the view follows the tail.
     follow: bool,
     fill: Attr,
+    /// The active text selection, if any. Positions are in absolute
+    /// wrapped-row coordinates (see [`SelPos`]). Dropped whenever the buffer
+    /// mutates, since row indices would otherwise dangle.
+    selection: Option<Selection>,
 }
 
 impl StreamView {
@@ -215,6 +251,7 @@ impl StreamView {
             top: 0,
             follow: true,
             fill: Attr::new(TvColor::LightGray, TvColor::Black),
+            selection: None,
         }
     }
 
@@ -229,6 +266,9 @@ impl StreamView {
 
     /// Appends a completed line.
     pub fn push_line(&mut self, cells: &[Cell]) {
+        // Row indices shift when the buffer grows/trims, so a held selection
+        // would dangle; drop it.
+        self.selection = None;
         let normalized = normalize_line(cells);
         let rows = wrap_cells(&normalized, self.width());
         self.row_counts.push(rows.len());
@@ -264,6 +304,7 @@ impl StreamView {
         self.partial_wrapped.clear();
         self.top = 0;
         self.follow = true;
+        self.selection = None;
     }
 
     /// Total displayed lines, including the in-progress one.
@@ -332,6 +373,117 @@ impl StreamView {
     #[must_use]
     pub fn is_at_bottom(&self) -> bool {
         self.follow
+    }
+
+    // ---- selection ----
+
+    /// Selects the entire scrollback in stream mode. Leaves no selection if
+    /// the buffer is empty.
+    pub fn select_all(&mut self) {
+        let rows = self.row_count();
+        if rows == 0 {
+            self.selection = None;
+            return;
+        }
+        let last = rows - 1;
+        let last_len = self.row_at(last).map_or(0, Vec::len);
+        self.selection = Some(Selection {
+            anchor: SelPos { row: 0, col: 0 },
+            head: SelPos {
+                row: last,
+                col: last_len,
+            },
+        });
+    }
+
+    /// Sets a selection between two carets `(row, col)`. Order-independent:
+    /// anchor and head may be given in either order.
+    pub fn set_selection(&mut self, anchor: (usize, usize), head: (usize, usize)) {
+        self.selection = Some(Selection {
+            anchor: SelPos {
+                row: anchor.0,
+                col: anchor.1,
+            },
+            head: SelPos {
+                row: head.0,
+                col: head.1,
+            },
+        });
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    #[must_use]
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some()
+    }
+
+    /// The selected text, or `None` when there is no selection. Logical lines
+    /// are reconstructed: a soft wrap within a line does not become a newline.
+    #[must_use]
+    pub fn selected_text(&self) -> Option<String> {
+        let sel = self.selection?;
+        let (start, end) = order(sel.anchor, sel.head);
+        let mut out = String::new();
+        for row in start.row..=end.row {
+            let Some(cells) = self.row_at(row) else {
+                continue;
+            };
+            let from = if row == start.row { start.col } else { 0 }.min(cells.len());
+            let to = if row == end.row { end.col } else { cells.len() }.min(cells.len());
+            if row > start.row && self.row_is_logical_start(row) {
+                out.push('\n');
+            }
+            out.extend(cells[from..to.max(from)].iter().map(|c| c.ch).filter(|&ch| ch != '\0'));
+        }
+        Some(out)
+    }
+
+    fn row_at(&self, idx: usize) -> Option<&Vec<Cell>> {
+        self.iter_rows().nth(idx)
+    }
+
+    /// Maps a screen position to a caret in the scrollback, or `None` if it
+    /// falls outside the view or below the last row. The column is clamped to
+    /// the hit row's length, so dragging past a line's end caps at its end.
+    fn hit(&self, pos: Point) -> Option<SelPos> {
+        let x = usize::try_from(pos.x - self.bounds.a.x).ok()?;
+        let y = usize::try_from(pos.y - self.bounds.a.y).ok()?;
+        if y >= self.page() {
+            return None;
+        }
+        let abs_row = self.top + y;
+        let len = self.row_at(abs_row)?.len();
+        Some(SelPos {
+            row: abs_row,
+            col: x.min(len),
+        })
+    }
+
+    /// Whether the cell at absolute wrapped-row `abs_row`, column `col` (a cell
+    /// index) lies inside the current selection.
+    fn is_selected(&self, abs_row: usize, col: usize) -> bool {
+        let Some(sel) = self.selection else {
+            return false;
+        };
+        let (s, e) = order(sel.anchor, sel.head);
+        (abs_row, col) >= (s.row, s.col) && (abs_row, col) < (e.row, e.col)
+    }
+
+    /// Whether absolute wrapped-row `abs_row` is the first row of a logical
+    /// line (as opposed to a soft-wrap continuation of the one above).
+    fn row_is_logical_start(&self, abs_row: usize) -> bool {
+        let mut offset = 0;
+        for &count in &self.row_counts {
+            if abs_row == offset {
+                return true;
+            }
+            offset += count;
+        }
+        // `offset` now equals `wrapped.len()`, where the partial line begins.
+        abs_row == offset
     }
 
     /// The whole scrollback with attributes stripped, for File > Save As.
@@ -412,8 +564,14 @@ impl View for StreamView {
                 buf.put_char(i, ' ', self.fill);
             }
             if let Some(line) = rows.get(row) {
+                let abs_row = self.top + row;
                 for (i, cell) in line.iter().take(width).enumerate() {
-                    buf.put_char(i, cell.ch, cell.attr);
+                    let attr = if self.is_selected(abs_row, i) {
+                        reverse(cell.attr)
+                    } else {
+                        cell.attr
+                    };
+                    buf.put_char(i, cell.ch, attr);
                 }
             }
             let y = self.bounds.a.y + i16::try_from(row).unwrap_or(i16::MAX);
@@ -422,20 +580,52 @@ impl View for StreamView {
     }
 
     fn handle_event(&mut self, event: &mut Event) {
-        if event.what != EventType::Keyboard {
-            return;
+        match event.what {
+            EventType::Keyboard => {
+                let page = self.page();
+                match event.key_code {
+                    KB_UP => self.scroll_up(1),
+                    KB_DOWN => self.scroll_down(1),
+                    KB_PGUP => self.scroll_up(page),
+                    KB_PGDN => self.scroll_down(page),
+                    KB_HOME => self.scroll_to_top(),
+                    KB_END => self.scroll_to_bottom(),
+                    KB_ESC if self.selection.is_some() => self.clear_selection(),
+                    _ => return,
+                }
+                event.clear();
+            }
+            EventType::MouseDown if event.mouse.buttons & MB_LEFT_BUTTON != 0 => {
+                let Some(pos) = self.hit(event.mouse.pos) else {
+                    return;
+                };
+                self.selection = Some(Selection {
+                    anchor: pos,
+                    head: pos,
+                });
+                event.clear();
+            }
+            EventType::MouseMove | EventType::MouseAuto
+                if event.mouse.buttons & MB_LEFT_BUTTON != 0 =>
+            {
+                if let (Some(mut sel), Some(pos)) = (self.selection, self.hit(event.mouse.pos)) {
+                    sel.head = pos;
+                    self.selection = Some(sel);
+                    event.clear();
+                }
+            }
+            EventType::MouseUp => {
+                // A press with no drag (anchor == head) is a plain click: it
+                // selects nothing, so drop the empty selection.
+                if let Some(sel) = self.selection
+                    && sel.anchor == sel.head
+                {
+                    self.selection = None;
+                }
+                event.clear();
+            }
+            _ => {}
         }
-        let page = self.page();
-        match event.key_code {
-            KB_UP => self.scroll_up(1),
-            KB_DOWN => self.scroll_down(1),
-            KB_PGUP => self.scroll_up(page),
-            KB_PGDN => self.scroll_down(page),
-            KB_HOME => self.scroll_to_top(),
-            KB_END => self.scroll_to_bottom(),
-            _ => return,
-        }
-        event.clear();
     }
 
     fn grow_mode(&self) -> GrowFlags {
@@ -473,6 +663,110 @@ mod tests {
 
     fn view() -> StreamView {
         StreamView::new(Rect::new(0, 0, 40, 10))
+    }
+
+    #[test]
+    fn select_all_extracts_logical_lines_without_soft_wrap_newlines() {
+        let mut v = StreamView::new(Rect::new(0, 0, 10, 10));
+        v.push_line(&line("hello"));
+        v.push_line(&line("abcdefghijABCDEFGHIJ")); // 20 cols wraps at width 10
+        v.select_all();
+        assert_eq!(
+            v.selected_text().unwrap(),
+            "hello\nabcdefghijABCDEFGHIJ",
+            "soft wraps within a logical line must not become newlines"
+        );
+    }
+
+    #[test]
+    fn stream_selection_spans_from_anchor_to_head_across_a_line_break() {
+        let mut v = view();
+        v.push_line(&line("hello"));
+        v.push_line(&line("world"));
+        // caret before col 2 of row 0 to caret before col 3 of row 1
+        v.set_selection((0, 2), (1, 3));
+        assert_eq!(v.selected_text().unwrap(), "llo\nwor");
+    }
+
+    #[test]
+    fn stream_selection_is_order_independent() {
+        let mut v = view();
+        v.push_line(&line("hello"));
+        v.push_line(&line("world"));
+        v.set_selection((1, 3), (0, 2)); // reversed
+        assert_eq!(v.selected_text().unwrap(), "llo\nwor");
+    }
+
+    #[test]
+    fn no_selection_yields_no_text() {
+        let mut v = view();
+        v.push_line(&line("hello"));
+        assert!(v.selected_text().is_none());
+        assert!(!v.has_selection());
+    }
+
+    #[test]
+    fn selected_cells_render_reverse_video() {
+        let mut v = StreamView::new(Rect::new(0, 0, 8, 4));
+        v.push_line(&line("abcd"));
+        v.set_selection((0, 1), (0, 3)); // 'b','c'
+        let mut terminal = fake_terminal(20, 10);
+        v.draw(&mut terminal);
+        let a = terminal.read_cell(0, 0).unwrap(); // unselected 'a'
+        let b = terminal.read_cell(1, 0).unwrap(); // selected 'b'
+        assert_eq!(b.ch, 'b');
+        assert_eq!(b.attr.fg, a.attr.bg, "selected fg is the normal bg");
+        assert_eq!(b.attr.bg, a.attr.fg, "selected bg is the normal fg");
+        // The cell just past the selection ('d' region, col 3) is normal.
+        let d = terminal.read_cell(3, 0).unwrap();
+        assert_eq!(d.attr.fg, a.attr.fg, "col 3 is outside [1,3), so normal");
+    }
+
+    #[test]
+    fn mouse_drag_creates_a_stream_selection() {
+        let mut v = view();
+        v.push_line(&line("hello"));
+        v.push_line(&line("world"));
+        let mut down = Event::mouse(EventType::MouseDown, Point::new(2, 0), MB_LEFT_BUTTON, false);
+        v.handle_event(&mut down);
+        let mut mv = Event::mouse(EventType::MouseMove, Point::new(3, 1), MB_LEFT_BUTTON, false);
+        v.handle_event(&mut mv);
+        let mut up = Event::mouse(EventType::MouseUp, Point::new(3, 1), 0, false);
+        v.handle_event(&mut up);
+        assert_eq!(v.selected_text().unwrap(), "llo\nwor");
+    }
+
+    #[test]
+    fn a_plain_click_clears_any_selection() {
+        let mut v = view();
+        v.push_line(&line("hello"));
+        v.select_all();
+        assert!(v.has_selection());
+        let mut down = Event::mouse(EventType::MouseDown, Point::new(2, 0), MB_LEFT_BUTTON, false);
+        v.handle_event(&mut down);
+        let mut up = Event::mouse(EventType::MouseUp, Point::new(2, 0), 0, false);
+        v.handle_event(&mut up);
+        assert!(!v.has_selection(), "click without drag deselects");
+    }
+
+    #[test]
+    fn esc_clears_the_selection() {
+        let mut v = view();
+        v.push_line(&line("hello"));
+        v.select_all();
+        let mut esc = Event::keyboard(KB_ESC);
+        v.handle_event(&mut esc);
+        assert!(!v.has_selection());
+    }
+
+    #[test]
+    fn mutating_the_buffer_clears_the_selection() {
+        let mut v = view();
+        v.push_line(&line("hello"));
+        v.select_all();
+        assert!(v.has_selection());
+        v.push_line(&line("more"));
+        assert!(!v.has_selection(), "new content must drop a stale selection");
     }
 
     /// An in-memory `Backend` for tests: no real TTY, fixed size, no I/O.

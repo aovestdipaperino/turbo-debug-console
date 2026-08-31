@@ -120,6 +120,10 @@ fn main() -> turbo_vision::core::error::Result<()> {
 
     let mut console = Console::default();
 
+    // Copy starts disabled: nothing is selected yet. `sync_command_state`
+    // keeps it in step from here on.
+    app.disable_command(cmd::CM_COPY);
+
     app.draw();
     let _ = app.terminal.flush();
 
@@ -158,6 +162,7 @@ fn main() -> turbo_vision::core::error::Result<()> {
         }
 
         if dirty {
+            console.sync_command_state(&mut app);
             app.draw();
             let _ = app.terminal.flush();
         }
@@ -238,8 +243,57 @@ impl Console {
                     self.save_as(app, id);
                 }
             }
+            cmd::CM_SELECT_ALL => {
+                if let Some(id) = focused_id {
+                    self.sessions.select_all(id);
+                }
+            }
+            cmd::CM_COPY => {
+                if let Some(id) = focused_id {
+                    self.copy_selection(app, id);
+                }
+            }
             cmd::CM_OPEN_CAPTURE => self.open_capture(app),
             _ => {}
+        }
+    }
+
+    /// Copies the focused window's current selection to the clipboard, with a
+    /// brief confirmation. `CM_COPY` is disabled unless something is selected
+    /// (see [`Self::can_copy`]), so the empty case is just a defensive no-op.
+    fn copy_selection(&self, app: &mut Application, id: SessionId) {
+        let Some(text) = self.sessions.selected_text(id).filter(|t| !t.is_empty()) else {
+            return;
+        };
+        let lines = text.lines().count();
+        turbo_vision::core::clipboard::set_clipboard(&text);
+        msgbox::message_box_ok(
+            app,
+            &format!(
+                "Copied {lines} line{} to the clipboard.",
+                if lines == 1 { "" } else { "s" }
+            ),
+        );
+    }
+
+    /// Whether the focused window has copyable (non-empty) selected text.
+    fn can_copy(&self, focused_id: Option<SessionId>) -> bool {
+        focused_id
+            .and_then(|id| self.sessions.selected_text(id))
+            .is_some_and(|t| !t.is_empty())
+    }
+
+    /// Keeps `CM_COPY` enabled only while the focused window has a selection,
+    /// so the menu item greys out otherwise. Cheap enough to call each frame.
+    fn sync_command_state(&self, app: &mut Application) {
+        let focused_id = app
+            .desktop
+            .top_view_id()
+            .and_then(|id| self.window_ids.get(&id).copied());
+        if self.can_copy(focused_id) {
+            app.enable_command(cmd::CM_COPY);
+        } else {
+            app.disable_command(cmd::CM_COPY);
         }
     }
 
@@ -523,13 +577,13 @@ fn build_menu_bar(width: i16) -> MenuBar {
         ]),
     ));
     menu_bar.add_submenu(SubMenu::new(
-        "~V~iew",
-        Menu::from_items(vec![MenuItem::new(
-            "~C~lear window",
-            cmd::CM_CLEAR_WINDOW,
-            0,
-            0,
-        )]),
+        "~E~dit",
+        Menu::from_items(vec![
+            MenuItem::new("~C~opy", cmd::CM_COPY, 0, 0),
+            MenuItem::new("Select ~A~ll", cmd::CM_SELECT_ALL, 0, 0),
+            MenuItem::separator(),
+            MenuItem::new("C~l~ear window", cmd::CM_CLEAR_WINDOW, 0, 0),
+        ]),
     ));
     menu_bar.add_submenu(SubMenu::new(
         "~W~indow",
@@ -761,6 +815,28 @@ mod console_decision_tests {
         std::rc::Rc::new(std::cell::RefCell::new(StreamView::new(Rect::new(
             0, 0, 80, 24,
         ))))
+    }
+
+    #[test]
+    fn copy_is_available_only_with_a_nonempty_selection() {
+        let mut console = Console::default();
+        console.sessions.insert(
+            1,
+            "demo".into(),
+            0,
+            StreamKind::Tokens,
+            test_view(),
+            RENDER_OPTIONS,
+        );
+        assert!(!console.can_copy(None), "no focused window");
+        assert!(!console.can_copy(Some(1)), "nothing selected yet");
+
+        console.sessions.feed(1, b"hello\n");
+        console.sessions.select_all(1);
+        assert!(
+            console.can_copy(Some(1)),
+            "select-all over content is copyable"
+        );
     }
 }
 
