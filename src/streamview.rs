@@ -131,6 +131,12 @@ fn normalize_line(cells: &[Cell]) -> Vec<Cell> {
     out
 }
 
+/// Rows scrolled per mouse-wheel notch.
+const WHEEL_STEP: usize = 3;
+
+/// Columns reserved at the right edge of the view for the vertical scrollbar.
+const SCROLLBAR_WIDTH: usize = 1;
+
 /// Default scrollback depth.
 pub const DEFAULT_MAX_LINES: usize = 10_000;
 
@@ -234,6 +240,8 @@ pub struct StreamView {
     /// wrapped-row coordinates (see [`SelPos`]). Dropped whenever the buffer
     /// mutates, since row indices would otherwise dangle.
     selection: Option<Selection>,
+    /// True while the scrollbar thumb is being dragged with the mouse.
+    dragging_thumb: bool,
 }
 
 impl StreamView {
@@ -252,11 +260,20 @@ impl StreamView {
             follow: true,
             fill: Attr::new(TvColor::LightGray, TvColor::Black),
             selection: None,
+            dragging_thumb: false,
         }
     }
 
+    /// Width of the text area: the view minus the scrollbar column.
     fn width(&self) -> usize {
-        usize::try_from(self.bounds.width()).unwrap_or(0)
+        usize::try_from(self.bounds.width())
+            .unwrap_or(0)
+            .saturating_sub(SCROLLBAR_WIDTH)
+    }
+
+    /// Screen column of the scrollbar.
+    fn scrollbar_x(&self) -> i16 {
+        self.bounds.b.x - 1
     }
 
     pub fn set_max_lines(&mut self, n: usize) {
@@ -366,8 +383,136 @@ impl StreamView {
     }
 
     pub fn scroll_down(&mut self, n: usize) {
-        self.top = (self.top + n).min(self.max_top());
+        self.set_top(self.top + n);
+    }
+
+    /// Scrolls so that `top` is the first visible row, clamped to the
+    /// scrollback; re-arms autoscroll when that lands on the last page.
+    pub fn set_top(&mut self, top: usize) {
+        self.top = top.min(self.max_top());
         self.follow = self.top == self.max_top();
+    }
+
+    /// Index of the topmost visible row.
+    #[must_use]
+    pub fn top(&self) -> usize {
+        self.top
+    }
+
+    // ---- scrollbar ----
+
+    /// Track cells between the two arrows (the arrows are dropped when the
+    /// view is too short to hold them).
+    fn track_len(&self) -> usize {
+        let page = self.page();
+        if page >= 3 { page - 2 } else { page }
+    }
+
+    /// Row offset of the first track cell from the top of the view.
+    fn track_start(&self) -> usize {
+        usize::from(self.page() >= 3)
+    }
+
+    /// `(thumb_start, thumb_len)` in track cells, or `None` when everything
+    /// fits and there is nothing to scroll.
+    fn thumb(&self) -> Option<(usize, usize)> {
+        let rows = self.row_count();
+        let page = self.page();
+        let track = self.track_len();
+        if rows <= page || track == 0 {
+            return None;
+        }
+        let len = (track * page / rows).clamp(1, track);
+        let usable = track - len;
+        let start = if usable == 0 {
+            0
+        } else {
+            (self.top * usable).div_ceil(self.max_top()).min(usable)
+        };
+        Some((start, len))
+    }
+
+    /// Maps a screen row on the scrollbar track to a `top`, for thumb drags.
+    fn top_for_track_row(&self, y: i16) -> usize {
+        let Some((_, len)) = self.thumb() else {
+            return self.top;
+        };
+        let usable = self.track_len() - len;
+        if usable == 0 {
+            return self.top;
+        }
+        let rel = usize::try_from(y - self.bounds.a.y)
+            .unwrap_or(0)
+            .saturating_sub(self.track_start())
+            .min(usable);
+        rel * self.max_top() / usable
+    }
+
+    fn in_scrollbar(&self, pos: Point) -> bool {
+        pos.x == self.scrollbar_x()
+            && pos.y >= self.bounds.a.y
+            && pos.y < self.bounds.b.y
+            && self.bounds.width() > 0
+    }
+
+    fn in_view(&self, pos: Point) -> bool {
+        pos.x >= self.bounds.a.x
+            && pos.x < self.bounds.b.x
+            && pos.y >= self.bounds.a.y
+            && pos.y < self.bounds.b.y
+    }
+
+    /// A left click on the scrollbar: arrows step a row, the track pages,
+    /// the thumb starts a drag.
+    fn scrollbar_click(&mut self, y: i16) {
+        let rel = usize::try_from(y - self.bounds.a.y).unwrap_or(0);
+        let page = self.page();
+        if page >= 3 && rel == 0 {
+            self.scroll_up(1);
+        } else if page >= 3 && rel == page - 1 {
+            self.scroll_down(1);
+        } else if let Some((start, len)) = self.thumb() {
+            let track_row = rel - self.track_start();
+            if track_row < start {
+                self.scroll_up(page);
+            } else if track_row >= start + len {
+                self.scroll_down(page);
+            } else {
+                self.dragging_thumb = true;
+            }
+        }
+    }
+
+    fn draw_scrollbar(&self, terminal: &mut Terminal) {
+        if self.bounds.width() <= 0 {
+            return;
+        }
+        let track_attr = Attr::new(TvColor::DarkGray, self.fill.bg);
+        let thumb_attr = Attr::new(TvColor::LightGray, self.fill.bg);
+        let page = self.page();
+        let thumb = self.thumb();
+        let track_start = self.track_start();
+        let x = self.scrollbar_x();
+        for row in 0..page {
+            let (ch, attr) = if page >= 3 && row == 0 {
+                ('▲', thumb_attr)
+            } else if page >= 3 && row == page - 1 {
+                ('▼', thumb_attr)
+            } else {
+                match thumb {
+                    Some((start, len))
+                        if row - track_start >= start && row - track_start < start + len =>
+                    {
+                        ('█', thumb_attr)
+                    }
+                    _ => ('░', track_attr),
+                }
+            };
+            let mut buf = DrawBuffer::new(1);
+            buf.put_char(0, ch, attr);
+            let y = self.bounds.a.y + i16::try_from(row).unwrap_or(i16::MAX);
+            write_line_to_terminal(terminal, x, y, &buf);
+        }
     }
 
     #[must_use]
@@ -436,7 +581,12 @@ impl StreamView {
             if row > start.row && self.row_is_logical_start(row) {
                 out.push('\n');
             }
-            out.extend(cells[from..to.max(from)].iter().map(|c| c.ch).filter(|&ch| ch != '\0'));
+            out.extend(
+                cells[from..to.max(from)]
+                    .iter()
+                    .map(|c| c.ch)
+                    .filter(|&ch| ch != '\0'),
+            );
         }
         Some(out)
     }
@@ -451,7 +601,7 @@ impl StreamView {
     fn hit(&self, pos: Point) -> Option<SelPos> {
         let x = usize::try_from(pos.x - self.bounds.a.x).ok()?;
         let y = usize::try_from(pos.y - self.bounds.a.y).ok()?;
-        if y >= self.page() {
+        if y >= self.page() || x >= self.width() {
             return None;
         }
         let abs_row = self.top + y;
@@ -538,7 +688,7 @@ impl View for StreamView {
     }
 
     fn set_bounds(&mut self, bounds: Rect) {
-        let width_changed = self.width() != usize::try_from(bounds.width()).unwrap_or(0);
+        let width_changed = self.bounds.width() != bounds.width();
         self.bounds = bounds;
         if width_changed {
             self.rewrap();
@@ -554,7 +704,7 @@ impl View for StreamView {
         if self.bounds.height() <= 0 {
             return;
         }
-        let width = usize::try_from(self.bounds.width()).unwrap_or(0);
+        let width = self.width();
         let page = self.page();
         let rows: Vec<&Vec<Cell>> = self.iter_rows().skip(self.top).take(page).collect();
 
@@ -577,6 +727,7 @@ impl View for StreamView {
             let y = self.bounds.a.y + i16::try_from(row).unwrap_or(i16::MAX);
             write_line_to_terminal(terminal, self.bounds.a.x, y, &buf);
         }
+        self.draw_scrollbar(terminal);
     }
 
     fn handle_event(&mut self, event: &mut Event) {
@@ -593,6 +744,26 @@ impl View for StreamView {
                     KB_ESC if self.selection.is_some() => self.clear_selection(),
                     _ => return,
                 }
+                event.clear();
+            }
+            EventType::MouseWheelUp if self.in_view(event.mouse.pos) => {
+                self.scroll_up(WHEEL_STEP);
+                event.clear();
+            }
+            EventType::MouseWheelDown if self.in_view(event.mouse.pos) => {
+                self.scroll_down(WHEEL_STEP);
+                event.clear();
+            }
+            EventType::MouseDown
+                if event.mouse.buttons & MB_LEFT_BUTTON != 0
+                    && self.in_scrollbar(event.mouse.pos) =>
+            {
+                self.scrollbar_click(event.mouse.pos.y);
+                event.clear();
+            }
+            EventType::MouseMove | EventType::MouseAuto if self.dragging_thumb => {
+                let top = self.top_for_track_row(event.mouse.pos.y);
+                self.set_top(top);
                 event.clear();
             }
             EventType::MouseDown if event.mouse.buttons & MB_LEFT_BUTTON != 0 => {
@@ -615,6 +786,7 @@ impl View for StreamView {
                 }
             }
             EventType::MouseUp => {
+                self.dragging_thumb = false;
                 // A press with no drag (anchor == head) is a plain click: it
                 // selects nothing, so drop the empty selection.
                 if let Some(sel) = self.selection
@@ -661,13 +833,15 @@ mod tests {
             .collect()
     }
 
+    /// Test views are sized one column wider than the text they are meant to
+    /// hold: the rightmost column is the scrollbar, not text.
     fn view() -> StreamView {
-        StreamView::new(Rect::new(0, 0, 40, 10))
+        StreamView::new(Rect::new(0, 0, 41, 10))
     }
 
     #[test]
     fn select_all_extracts_logical_lines_without_soft_wrap_newlines() {
-        let mut v = StreamView::new(Rect::new(0, 0, 10, 10));
+        let mut v = StreamView::new(Rect::new(0, 0, 11, 10));
         v.push_line(&line("hello"));
         v.push_line(&line("abcdefghijABCDEFGHIJ")); // 20 cols wraps at width 10
         v.select_all();
@@ -727,9 +901,19 @@ mod tests {
         let mut v = view();
         v.push_line(&line("hello"));
         v.push_line(&line("world"));
-        let mut down = Event::mouse(EventType::MouseDown, Point::new(2, 0), MB_LEFT_BUTTON, false);
+        let mut down = Event::mouse(
+            EventType::MouseDown,
+            Point::new(2, 0),
+            MB_LEFT_BUTTON,
+            false,
+        );
         v.handle_event(&mut down);
-        let mut mv = Event::mouse(EventType::MouseMove, Point::new(3, 1), MB_LEFT_BUTTON, false);
+        let mut mv = Event::mouse(
+            EventType::MouseMove,
+            Point::new(3, 1),
+            MB_LEFT_BUTTON,
+            false,
+        );
         v.handle_event(&mut mv);
         let mut up = Event::mouse(EventType::MouseUp, Point::new(3, 1), 0, false);
         v.handle_event(&mut up);
@@ -742,7 +926,12 @@ mod tests {
         v.push_line(&line("hello"));
         v.select_all();
         assert!(v.has_selection());
-        let mut down = Event::mouse(EventType::MouseDown, Point::new(2, 0), MB_LEFT_BUTTON, false);
+        let mut down = Event::mouse(
+            EventType::MouseDown,
+            Point::new(2, 0),
+            MB_LEFT_BUTTON,
+            false,
+        );
         v.handle_event(&mut down);
         let mut up = Event::mouse(EventType::MouseUp, Point::new(2, 0), 0, false);
         v.handle_event(&mut up);
@@ -766,7 +955,10 @@ mod tests {
         v.select_all();
         assert!(v.has_selection());
         v.push_line(&line("more"));
-        assert!(!v.has_selection(), "new content must drop a stale selection");
+        assert!(
+            !v.has_selection(),
+            "new content must drop a stale selection"
+        );
     }
 
     /// An in-memory `Backend` for tests: no real TTY, fixed size, no I/O.
@@ -1029,8 +1221,8 @@ mod tests {
 
     #[test]
     fn draw_clips_to_bounds_width() {
-        let mut v = StreamView::new(Rect::new(2, 1, 8, 4));
-        v.push_line(&line("short")); // shorter than the 6-wide view
+        let mut v = StreamView::new(Rect::new(2, 1, 9, 4));
+        v.push_line(&line("short")); // shorter than the 6-wide text area
 
         let mut terminal = fake_terminal(20, 10);
         v.draw(&mut terminal);
@@ -1043,8 +1235,10 @@ mod tests {
                 .expect("cell within terminal bounds");
             assert_eq!(cell.ch, expected);
         }
-        // Nothing is drawn past the view's width (x == 8 is out of bounds).
-        assert_eq!(terminal.read_cell(8, 1).unwrap().ch, ' ');
+        // The last column of the view is the scrollbar (its up arrow on the
+        // top row); nothing is drawn past the view's width (x == 9).
+        assert_eq!(terminal.read_cell(8, 1).unwrap().ch, '▲');
+        assert_eq!(terminal.read_cell(9, 1).unwrap().ch, ' ');
 
         // Nothing above the view's rows was touched.
         assert_eq!(terminal.read_cell(2, 0).unwrap().ch, ' ');
@@ -1064,7 +1258,7 @@ mod tests {
     #[test]
     fn wide_character_row_paints_the_correct_total_number_of_columns() {
         // wrench (2 columns) + space + x = 4 columns total.
-        let mut v = StreamView::new(Rect::new(0, 0, 10, 4));
+        let mut v = StreamView::new(Rect::new(0, 0, 11, 4));
         v.push_line(&line(&format!("{WRENCH} x")));
         let mut terminal = fake_terminal(20, 10);
         v.draw(&mut terminal);
@@ -1102,8 +1296,8 @@ mod tests {
 
     #[test]
     fn short_row_is_blank_padded_so_nothing_shows_through_from_beneath() {
-        let mut v = StreamView::new(Rect::new(0, 0, 10, 4));
-        // First paint a row that fills the whole width...
+        let mut v = StreamView::new(Rect::new(0, 0, 11, 4));
+        // First paint a row that fills the whole text width...
         v.push_line(&line("XXXXXXXXXX"));
         let mut terminal = fake_terminal(20, 10);
         v.draw(&mut terminal);
@@ -1133,7 +1327,7 @@ mod tests {
         // 3 would land squarely on the filler cell, splitting the glyph in
         // half; the wrap must instead push the whole character to the next
         // row.
-        let mut v = StreamView::new(Rect::new(0, 0, 3, 4));
+        let mut v = StreamView::new(Rect::new(0, 0, 4, 4));
         v.push_line(&line("ab中cd"));
 
         assert_eq!(v.row_count(), 3, "the 6-column line wraps to three rows");
@@ -1174,11 +1368,11 @@ mod tests {
     /// window afterwards.
     #[test]
     fn a_covering_window_s_flush_fully_blanks_a_row_that_held_a_wide_character() {
-        let (mut terminal, output) = recording_terminal(30, 4);
-        let mut grid = vec![vec![' '; 30]; 4];
+        let (mut terminal, output) = recording_terminal(31, 4);
+        let mut grid = vec![vec![' '; 31]; 4];
 
         // Lower window: the real banner line at row 0, drawn and flushed.
-        let mut lower = StreamView::new(Rect::new(0, 0, 30, 4));
+        let mut lower = StreamView::new(Rect::new(0, 0, 31, 4));
         lower.push_line(&line(&format!("{WRENCH} Reading src/dsml.rs 1:500...")));
         lower.draw(&mut terminal);
         terminal
@@ -1190,7 +1384,7 @@ mod tests {
         // Upper window: same bounds, no content of its own at all -- opens
         // on top and must blank every column of row 0 that the lower
         // window's banner occupied.
-        let mut upper = StreamView::new(Rect::new(0, 0, 30, 4));
+        let mut upper = StreamView::new(Rect::new(0, 0, 31, 4));
         upper.draw(&mut terminal);
         terminal
             .flush()
@@ -1198,8 +1392,8 @@ mod tests {
         replay_onto_grid(&output.lock().unwrap(), &mut grid);
 
         // Row 0 must now be fully blank -- nothing from the lower window's
-        // banner may still show through.
-        for (col, &ch) in grid[0].iter().enumerate() {
+        // banner may still show through. (Column 30 is the scrollbar.)
+        for (col, &ch) in grid[0].iter().take(30).enumerate() {
             assert_eq!(
                 ch, ' ',
                 "row 0 column {col} still shows a leftover character from \
@@ -1210,7 +1404,7 @@ mod tests {
 
     #[test]
     fn a_line_longer_than_the_width_wraps_across_the_right_number_of_rows_with_complete_content() {
-        let mut v = StreamView::new(Rect::new(0, 0, 10, 20));
+        let mut v = StreamView::new(Rect::new(0, 0, 11, 20));
         // 25 non-space characters at width 10 -> ceil(25/10) = 3 rows.
         let text = "abcdefghijklmnopqrstuvwxy";
         v.push_line(&line(text));
@@ -1237,7 +1431,7 @@ mod tests {
 
     #[test]
     fn a_wrap_breaks_at_a_space_rather_than_mid_word_when_one_is_available() {
-        let mut v = StreamView::new(Rect::new(0, 0, 10, 20));
+        let mut v = StreamView::new(Rect::new(0, 0, 11, 20));
         v.push_line(&line("hello world"));
 
         // "hello world" is 11 columns wide; wrapping at 10 without a
@@ -1292,16 +1486,16 @@ mod tests {
 
     #[test]
     fn resizing_narrower_then_wider_rewraps_and_content_survives_both() {
-        let mut v = StreamView::new(Rect::new(0, 0, 20, 20));
+        let mut v = StreamView::new(Rect::new(0, 0, 21, 20));
         let text = "abcdefghijklmnopqrstuvwxyz";
         v.push_line(&line(text));
         assert_eq!(v.row_count(), 2); // ceil(26/20)
 
-        v.set_bounds(Rect::new(0, 0, 5, 20));
+        v.set_bounds(Rect::new(0, 0, 6, 20));
         assert_eq!(v.row_count(), 6); // ceil(26/5)
         assert_eq!(v.plain_text(), text);
 
-        v.set_bounds(Rect::new(0, 0, 30, 20));
+        v.set_bounds(Rect::new(0, 0, 31, 20));
         assert_eq!(v.row_count(), 1); // fits on one row now
         assert_eq!(v.plain_text(), text);
     }
@@ -1309,7 +1503,7 @@ mod tests {
     #[test]
     fn scrolling_by_page_lands_correctly_when_wrapped_rows_are_present() {
         // One long line that wraps to 20 rows, in a 5-row-tall view.
-        let mut v = StreamView::new(Rect::new(0, 0, 4, 5));
+        let mut v = StreamView::new(Rect::new(0, 0, 5, 5));
         let text: String = (0..80).map(|i| char::from(b'a' + (i % 26))).collect();
         v.push_line(&line(&text));
         assert_eq!(v.row_count(), 20);
@@ -1324,6 +1518,122 @@ mod tests {
 
         v.scroll_to_bottom();
         assert_eq!(v.top, v.row_count() - v.page());
+    }
+
+    fn mouse(what: EventType, x: i16, y: i16, buttons: u8) -> Event {
+        Event::mouse(what, Point::new(x, y), buttons, false)
+    }
+
+    /// A 41x10 view with 50 one-row lines: page 10, `max_top` 40.
+    fn scrollable_view() -> StreamView {
+        let mut v = view();
+        for i in 0..50 {
+            v.push_line(&line(&i.to_string()));
+        }
+        v
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_by_a_few_rows_and_releases_autoscroll() {
+        let mut v = scrollable_view();
+        assert!(v.is_at_bottom());
+        let mut ev = mouse(EventType::MouseWheelUp, 5, 5, 0);
+        v.handle_event(&mut ev);
+        assert_eq!(ev.what, EventType::Nothing, "the wheel event is consumed");
+        assert_eq!(v.top(), 40 - WHEEL_STEP);
+        assert!(!v.is_at_bottom());
+
+        v.handle_event(&mut mouse(EventType::MouseWheelDown, 5, 5, 0));
+        assert_eq!(v.top(), 40);
+        assert!(
+            v.is_at_bottom(),
+            "wheeling back to the end re-arms autoscroll"
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_outside_the_view_is_ignored() {
+        let mut v = scrollable_view();
+        let mut ev = mouse(EventType::MouseWheelUp, 60, 5, 0);
+        v.handle_event(&mut ev);
+        assert_eq!(ev.what, EventType::MouseWheelUp);
+        assert_eq!(v.top(), 40);
+    }
+
+    #[test]
+    fn scrollbar_arrows_step_one_row_and_track_pages() {
+        let mut v = scrollable_view();
+        let x = v.scrollbar_x();
+        assert_eq!(x, 40);
+
+        v.handle_event(&mut mouse(EventType::MouseDown, x, 0, MB_LEFT_BUTTON));
+        assert_eq!(v.top(), 39, "up arrow steps one row");
+        v.handle_event(&mut mouse(EventType::MouseDown, x, 9, MB_LEFT_BUTTON));
+        assert_eq!(v.top(), 40, "down arrow steps one row");
+
+        // Thumb sits at the bottom of the track; clicking the track above
+        // it pages up.
+        v.handle_event(&mut mouse(EventType::MouseDown, x, 1, MB_LEFT_BUTTON));
+        assert_eq!(v.top(), 30, "track above the thumb pages up");
+        v.scroll_to_top();
+        v.handle_event(&mut mouse(EventType::MouseDown, x, 8, MB_LEFT_BUTTON));
+        assert_eq!(v.top(), 10, "track below the thumb pages down");
+    }
+
+    #[test]
+    fn dragging_the_thumb_scrolls_and_a_click_on_the_scrollbar_never_selects() {
+        let mut v = scrollable_view();
+        let x = v.scrollbar_x();
+        v.scroll_to_top();
+        let (start, len) = v.thumb().expect("50 rows in a 10-row view scroll");
+        assert_eq!((start, len), (0, 1));
+
+        // Press on the thumb (track row 0 -> screen row 1), drag to the
+        // bottom of the track, release.
+        v.handle_event(&mut mouse(EventType::MouseDown, x, 1, MB_LEFT_BUTTON));
+        assert!(v.dragging_thumb);
+        assert!(
+            v.selection.is_none(),
+            "a scrollbar press must not start a selection"
+        );
+        v.handle_event(&mut mouse(EventType::MouseMove, x, 8, MB_LEFT_BUTTON));
+        assert_eq!(v.top(), 40);
+        assert!(v.is_at_bottom());
+        v.handle_event(&mut mouse(EventType::MouseMove, x, 4, MB_LEFT_BUTTON));
+        assert!(v.top() > 0 && v.top() < 40);
+        v.handle_event(&mut mouse(EventType::MouseUp, x, 4, 0));
+        assert!(!v.dragging_thumb);
+        assert!(v.selection.is_none());
+    }
+
+    #[test]
+    fn scrollbar_draws_arrows_and_a_thumb_that_tracks_the_position() {
+        let mut v = scrollable_view();
+        let x = v.scrollbar_x();
+        let mut terminal = fake_terminal(50, 10);
+        v.draw(&mut terminal);
+        assert_eq!(terminal.read_cell(x, 0).unwrap().ch, '▲');
+        assert_eq!(terminal.read_cell(x, 9).unwrap().ch, '▼');
+        // At the bottom the thumb is the last track cell.
+        assert_eq!(terminal.read_cell(x, 8).unwrap().ch, '█');
+        assert_eq!(terminal.read_cell(x, 1).unwrap().ch, '░');
+
+        v.scroll_to_top();
+        v.draw(&mut terminal);
+        assert_eq!(terminal.read_cell(x, 1).unwrap().ch, '█');
+        assert_eq!(terminal.read_cell(x, 8).unwrap().ch, '░');
+    }
+
+    #[test]
+    fn scrollbar_has_no_thumb_when_everything_fits() {
+        let mut v = view();
+        v.push_line(&line("one"));
+        assert!(v.thumb().is_none());
+        let mut terminal = fake_terminal(50, 10);
+        v.draw(&mut terminal);
+        for y in 1..9 {
+            assert_eq!(terminal.read_cell(v.scrollbar_x(), y).unwrap().ch, '░');
+        }
     }
 
     #[test]

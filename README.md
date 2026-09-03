@@ -117,13 +117,17 @@ verbatim rather than dropped.
 | `F6` | next window |
 | `Alt-X` | quit |
 | `PgUp` / `PgDn` / `Home` / `End` | scroll the focused window |
+| mouse wheel | scroll the window under the pointer |
+| scrollbar (right edge) | arrows step a row, the track pages, drag the thumb |
 | drag (left mouse) | select text in the focused window |
 | `Esc` | clear the selection |
 
 Long lines wrap to the window's width rather than being cut off, so there is
 nothing to scroll horizontally to; scrolling is vertical only, by display
-row. Scrolling back releases autoscroll; `End` re-arms it, so a window you
-are reading does not yank itself to the bottom when new output arrives.
+row. Scrolling back releases autoscroll; `End`, or scrolling back down to the
+last row, re-arms it, so a window you are reading does not yank itself to the
+bottom when new output arrives. Each window has a vertical scrollbar along
+its right edge whose thumb shows where in the scrollback you are.
 
 Drag with the left mouse button to select text; the selection follows the
 mouse and survives scrolling. A selection spanning wrapped lines copies back

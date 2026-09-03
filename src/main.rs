@@ -85,7 +85,7 @@ fn handle_cli_flags() {
                      \n\
                      KEYS\n    \
                      F10 menu   F6 next window   Alt-X quit\n    \
-                     PgUp/PgDn/Home/End scroll the focused window\n\
+                     PgUp/PgDn/Home/End, the mouse wheel or the scrollbar scroll a window\n\
                      \n\
                      {}",
                     env!("CARGO_PKG_VERSION"),
