@@ -15,16 +15,16 @@ use turbo_debug_console::registry::{Server, ServerEvent, SessionId};
 use turbo_debug_console::session::{Sessions, SharedStreamView, format_title};
 use turbo_debug_console::streamview::StreamView;
 use turbo_vision::app::Application;
-use turbo_vision::core::command::{CM_NEXT, CM_QUIT};
+use turbo_vision::core::command::{CM_NEXT, CM_QUIT, CM_TOGGLE_BLOCK_MODE};
 use turbo_vision::core::event::{EventType, KB_ALT_X, KB_F6, KB_F10};
 use turbo_vision::core::geometry::Rect;
 use turbo_vision::core::menu_data::{Menu, MenuItem};
-use turbo_vision::core::state::{SF_CLOSED, shadow_size};
+use turbo_vision::core::state::{SF_CLOSED, SF_SHADOW};
 use turbo_vision::views::file_dialog::FileDialog;
 use turbo_vision::views::menu_bar::{MenuBar, SubMenu};
 use turbo_vision::views::msgbox;
 use turbo_vision::views::status_line::{StatusItem, StatusLine};
-use turbo_vision::views::view::ViewId;
+use turbo_vision::views::view::{View, ViewId};
 use turbo_vision::views::window::{Window, WindowBuilder};
 
 /// A bounded number of pending stream-server events drained per main-loop
@@ -116,7 +116,7 @@ fn main() -> turbo_vision::core::error::Result<()> {
 
     let mut app = Application::new()?;
     let (width, height) = app.terminal.size();
-    app.set_menu_bar(build_menu_bar(width));
+    app.set_menu_bar(build_menu_bar(width, false));
     app.set_status_line(build_status_line(width, height, 0));
 
     let mut server = match Server::bind(CONTROL_PORT) {
@@ -227,6 +227,12 @@ struct Console {
     sessions: Sessions,
     window_ids: HashMap<ViewId, SessionId>,
     session_windows: HashMap<SessionId, ViewId>,
+    /// Window > Auto-cleanup: when set, a window is closed the moment its
+    /// client goes away, instead of waiting for a manual Window > Cleanup.
+    /// Off by default — the disconnected window and its scrollback are still
+    /// the interesting thing to read after a crash, so throwing it away has
+    /// to be asked for.
+    auto_cleanup: bool,
 }
 
 /// What a decided [`ServerEvent`] means for the desktop: create a window for
@@ -284,6 +290,18 @@ impl Console {
             }
             cmd::CM_OPEN_CAPTURE => self.open_capture(app),
             cmd::CM_CLEANUP => self.cleanup_windows(app),
+            cmd::CM_AUTO_CLEANUP => {
+                self.auto_cleanup = !self.auto_cleanup;
+                // Rebuild the menu bar so the item's tick follows the flag,
+                // then act on it at once: switching it on with dead windows
+                // already on screen should sweep them, not wait for the next
+                // client to go away.
+                let (width, _) = app.terminal.size();
+                app.set_menu_bar(build_menu_bar(width, self.auto_cleanup));
+                if self.auto_cleanup {
+                    self.cleanup_windows(app);
+                }
+            }
             cmd::CM_TILE_WINDOWS => app.tile(),
             cmd::CM_CASCADE_WINDOWS => app.cascade(),
             _ => {}
@@ -422,6 +440,16 @@ impl Console {
             }
             ServerEvent::Disconnected { id } => {
                 self.sessions.mark_disconnected(id);
+                // With Auto-cleanup on, the window goes rather than gets
+                // retitled `[disconnected]`. Only the desktop side is done
+                // here: the main loop's `remove_closed_windows` sweep and
+                // `forget_closed_windows` drop the session and tear the
+                // server side down, exactly as for a hand-closed window.
+                if self.auto_cleanup
+                    && let Some(&view_id) = self.session_windows.get(&id)
+                {
+                    return Some(ConsoleIntent::CloseWindow { view_id });
+                }
                 self.retitle_intent(id)
             }
             ServerEvent::Closed { id } => {
@@ -491,6 +519,7 @@ impl Console {
                     .title(title)
                     .build();
                 apply_session_window_palette(&mut window);
+                drop_window_shadow(&mut window);
                 window.add(Box::new(SharedStreamView(view)));
                 let view_id = app.desktop.add(Box::new(window));
                 self.window_ids.insert(view_id, id);
@@ -607,25 +636,34 @@ impl Console {
             .title(name)
             .build();
         apply_session_window_palette(&mut window);
+        drop_window_shadow(&mut window);
         window.add(Box::new(SharedStreamView(view)));
         let view_id = app.desktop.add(Box::new(window));
         self.window_ids.insert(view_id, id);
     }
 }
 
-/// Bounds for a new stream window: the full tile rect, shrunk on the
-/// bottom-right by the window shadow. Every window shows its shadow by
-/// default (`SF_SHADOW`), and a window placed at the *exact* desktop bounds
-/// gets pushed up-and-left by `constrain_to_limits` to make room for that
-/// shadow — hiding its entire top row (title bar included) above row 0 and
-/// off screen. Reserving that room up front keeps the window, title bar
-/// included, fully on screen.
+/// Bounds for a new stream window: the full tile rect, edge to edge.
+///
+/// A session window fills the whole desktop, so there is nothing beside it
+/// for a shadow to fall on: the shadow would only eat the last two columns
+/// and the last row, leaving an unpainted black band down the right side of
+/// the desktop. `drop_window_shadow` clears `SF_SHADOW` on every window
+/// built from these bounds, which is also what keeps them here — with a
+/// shadow, `constrain_to_limits` pushes a window placed at the exact
+/// desktop bounds up-and-left to make room for it, hiding its top row
+/// (title bar included) above row 0.
 fn tile_window_bounds(app: &Application) -> Rect {
-    let mut bounds = app.get_tile_rect();
-    let (shadow_x, shadow_y) = shadow_size();
-    bounds.b.x -= shadow_x;
-    bounds.b.y -= shadow_y;
-    bounds
+    app.get_tile_rect()
+}
+
+/// Clears `SF_SHADOW`. A window that covers the desktop has nothing to cast
+/// a shadow onto, and keeping the flag would both paint a black band over
+/// the desktop's right and bottom edges and push the window off its own
+/// bounds (see `tile_window_bounds`).
+fn drop_window_shadow(window: &mut Window) {
+    let state = window.state();
+    window.set_state(state & !SF_SHADOW);
 }
 
 /// Bounds for a session's `StreamView`, given the *window's* outer bounds.
@@ -639,8 +677,17 @@ fn tile_window_bounds(app: &Application) -> Rect {
 /// outer window. Passing the outer window bounds here (as before) drew the
 /// view over the frame instead of inside it. See
 /// `turbo-vision-4-rust/src/views/log_window.rs` for the same idiom.
+///
+/// The width is the interior width *plus one*: the view deliberately
+/// overhangs the frame's right border column, and `StreamView` paints its
+/// scrollbar there. That is where `TEditWindow` puts its vertical scrollbar
+/// (`Rect::new(window_width - 1, 1, window_width, window_height - 2)` as a
+/// frame child drawn over the border), so the text area keeps the full
+/// interior width instead of losing a column to a scrollbar sitting *next*
+/// to the border. `Group::add` does not clip children, and the interior is
+/// drawn after the frame, so the overhang lands on top of the border.
 fn session_view_bounds(window_bounds: Rect) -> Rect {
-    Rect::new(0, 0, window_bounds.width() - 2, window_bounds.height() - 2)
+    Rect::new(0, 0, window_bounds.width() - 1, window_bounds.height() - 2)
 }
 
 /// Points a session window's palette at the app palette's "Black Window"
@@ -663,7 +710,25 @@ fn apply_session_window_palette(window: &mut Window) {
     window.set_custom_palette(vec![97, 98, 99, 100, 101, 102, 103, 104]);
 }
 
-fn build_menu_bar(width: i16) -> MenuBar {
+/// The Window > Auto-cleanup item, ticked when the flag is on. Unlike Edit >
+/// Block mode this cannot be a `MenuItem::flag`: that item's `checked`
+/// callback is a plain `fn() -> bool`, so it can only read global state, and
+/// auto-cleanup belongs to this `Console`. The state is carried in the item's
+/// text instead and the menu bar is rebuilt on each toggle. The leading
+/// character is a space when off rather than nothing at all, so the item's
+/// text — and with it the dropdown's width — does not change size as it is
+/// toggled.
+fn auto_cleanup_item(enabled: bool) -> MenuItem {
+    let mark = if enabled { '√' } else { ' ' };
+    MenuItem::new(
+        &format!("{mark} Auto-cleanu~p~"),
+        cmd::CM_AUTO_CLEANUP,
+        0,
+        0,
+    )
+}
+
+fn build_menu_bar(width: i16, auto_cleanup: bool) -> MenuBar {
     let mut menu_bar = MenuBar::new(Rect::new(0, 0, width, 1));
 
     menu_bar.add_submenu(SubMenu::new(
@@ -681,6 +746,17 @@ fn build_menu_bar(width: i16) -> MenuBar {
             MenuItem::new("~C~opy", cmd::CM_COPY, 0, 0),
             MenuItem::new("Select ~A~ll", cmd::CM_SELECT_ALL, 0, 0),
             MenuItem::separator(),
+            // A flag item: Turbo Vision owns `CM_TOGGLE_BLOCK_MODE` and the
+            // global mode behind it, and re-reads `block_edit_mode` on every
+            // draw, so the tick follows the flag with no menu rebuild.
+            MenuItem::flag(
+                "Bloc~k~ mode",
+                CM_TOGGLE_BLOCK_MODE,
+                0,
+                0,
+                turbo_vision::core::state::block_edit_mode,
+            ),
+            MenuItem::separator(),
             MenuItem::new("C~l~ear window", cmd::CM_CLEAR_WINDOW, 0, 0),
         ]),
     ));
@@ -692,6 +768,7 @@ fn build_menu_bar(width: i16) -> MenuBar {
             MenuItem::new("C~a~scade", cmd::CM_CASCADE_WINDOWS, 0, 0),
             MenuItem::separator(),
             MenuItem::new("Clean~u~p", cmd::CM_CLEANUP, 0, 0),
+            auto_cleanup_item(auto_cleanup),
         ]),
     ));
 
@@ -699,7 +776,7 @@ fn build_menu_bar(width: i16) -> MenuBar {
 }
 
 fn build_status_line(width: i16, height: i16, live: usize) -> StatusLine {
-    StatusLine::new(
+    let mut status_line = StatusLine::new(
         Rect::new(0, height - 1, width, height),
         vec![
             StatusItem::new("~F6~ Next", KB_F6, CM_NEXT),
@@ -707,7 +784,13 @@ fn build_status_line(width: i16, height: i16, live: usize) -> StatusLine {
             StatusItem::new("~Alt-X~ Exit", KB_ALT_X, CM_QUIT),
             StatusItem::new(&format!("{live} conn"), 0, 0),
         ],
-    )
+    );
+    // Block-edit mode marker at the right end of the status line, so the mode
+    // is visible while dragging out a selection.
+    status_line.set_right_indicator(|| {
+        turbo_vision::core::state::block_edit_mode().then(|| "▭ Block".to_string())
+    });
+    status_line
 }
 
 /// A centered file dialog sized to the current terminal, showing all files.
@@ -755,6 +838,39 @@ mod console_decision_tests {
     /// stale, `Attached` clears it, and `Disconnected` brings it back.
     /// (`has_stale_windows` itself needs real `ViewId`s, which only a live
     /// desktop can mint, so this pins the decision it reads.)
+    /// With Auto-cleanup off (the default) a disconnect only retitles the
+    /// window; with it on, the same event closes the window instead.
+    #[test]
+    fn auto_cleanup_turns_a_disconnect_into_a_window_close() {
+        let mut console = Console::default();
+        console.sessions.insert(
+            1,
+            "demo".into(),
+            61278,
+            StreamKind::Tokens,
+            Rc::new(RefCell::new(StreamView::new(Rect::new(0, 0, 20, 5)))),
+            RENDER_OPTIONS,
+        );
+        let view_id = ViewId::from_u16(7);
+        console.window_ids.insert(view_id, 1);
+        console.session_windows.insert(1, view_id);
+
+        assert!(
+            matches!(
+                console.decide_server_event(ServerEvent::Disconnected { id: 1 }),
+                Some(ConsoleIntent::Retitle { .. })
+            ),
+            "with the flag off a disconnect must only mark the title"
+        );
+
+        console.auto_cleanup = true;
+        assert_eq!(
+            console.decide_server_event(ServerEvent::Disconnected { id: 1 }),
+            Some(ConsoleIntent::CloseWindow { view_id }),
+            "with the flag on a disconnect must close the window"
+        );
+    }
+
     #[test]
     fn cleanup_availability_follows_the_session_connect_state() {
         let mut console = Console::default();
@@ -989,7 +1105,7 @@ mod console_decision_tests {
 /// bounds gets pushed up by `constrain_to_limits` to make room for its
 /// shadow, hiding the title bar off the top of the screen.
 #[cfg(test)]
-mod title_render_tests {
+pub mod title_render_tests {
     use std::io;
     use std::time::Duration;
 
@@ -1000,7 +1116,7 @@ mod title_render_tests {
     use turbo_vision::views::view::View;
     use turbo_vision::views::window::WindowBuilder;
 
-    struct NullBackend;
+    pub(super) struct NullBackend;
     impl Backend for NullBackend {
         fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
             self
@@ -1032,27 +1148,34 @@ mod title_render_tests {
     }
 
     /// A window whose bounds equal the tile rect returned by
-    /// `tile_window_bounds` (shadow-shrunk) renders its title on row 0 —
-    /// not pushed off screen.
+    /// `tile_window_bounds` (the full desktop) and whose shadow has been
+    /// dropped renders its title on row 0 — not pushed off screen — and
+    /// reaches the desktop's last column, with no shadow band left over.
     #[test]
-    fn shadow_shrunk_bounds_keep_the_title_bar_on_screen() {
+    fn shadowless_full_bounds_reach_the_right_edge_with_the_title_on_screen() {
         let mut terminal = Terminal::with_backend(Box::new(NullBackend)).unwrap();
-        let mut desktop = Desktop::new(Rect::new(0, 0, 80, 25));
+        let desktop_bounds = Rect::new(0, 0, 80, 25);
+        let mut desktop = Desktop::new(desktop_bounds);
 
-        let mut bounds = desktop.bounds();
-        let (shadow_x, shadow_y) = turbo_vision::core::state::shadow_size();
-        bounds.b.x -= shadow_x;
-        bounds.b.y -= shadow_y;
-
-        let window = WindowBuilder::new()
-            .bounds(bounds)
+        let mut window = WindowBuilder::new()
+            .bounds(desktop_bounds)
             .title("demo :61278")
             .build();
+        super::drop_window_shadow(&mut window);
         desktop.add(Box::new(window));
         desktop.draw(&mut terminal);
 
         let row0: String = terminal.buffer()[0].iter().map(|c| c.ch).collect();
         assert!(row0.contains("demo :61278"), "title not on row 0: {row0:?}");
+
+        // The frame's top-right corner must land on the desktop's last
+        // column: nothing (shadow included) may sit to the right of it.
+        let last = usize::try_from(desktop_bounds.b.x).unwrap() - 1;
+        let corner = terminal.buffer()[0][last].ch;
+        assert!(
+            corner != ' ' && corner != '\0',
+            "expected the window frame to reach the last column, found {corner:?} in {row0:?}"
+        );
     }
 
     /// Without the shadow-shrink, the same window (bounds == full desktop)
@@ -1084,17 +1207,20 @@ mod title_render_tests {
     /// *outer* bounds, so `Group::add` (relative -> absolute) placed it at
     /// the window's own origin, on top of the frame. A view added to a
     /// window's interior must be given bounds relative to the interior —
-    /// `(0, 0, w - 2, h - 2)` for a window of width `w`, height `h` — so
+    /// `(0, 0, w - 1, h - 2)` for a window of width `w`, height `h` — so
     /// that after `Window::add` its absolute bounds land one row/column
-    /// inside the frame on every side.
+    /// inside the frame on the left, top and bottom, and exactly on the
+    /// right border column, where the scrollbar is painted (as
+    /// `TEditWindow` does).
     #[test]
     fn stream_view_bounds_land_inside_the_frame_not_over_it() {
         use turbo_debug_console::streamview::StreamView;
 
         let window_bounds = Rect::new(0, 0, 40, 20);
         let view_bounds = super::session_view_bounds(window_bounds);
-        // Interior-relative: must start at the origin, not the window's.
-        assert_eq!(view_bounds, Rect::new(0, 0, 38, 18));
+        // Interior-relative: must start at the origin, not the window's,
+        // and overhang the interior by the one scrollbar column.
+        assert_eq!(view_bounds, Rect::new(0, 0, 39, 18));
 
         let mut window = WindowBuilder::new()
             .bounds(window_bounds)
@@ -1107,7 +1233,7 @@ mod title_render_tests {
         // frame on every side (Rect::b is exclusive), not the window's
         // outer bounds.
         let absolute = window.child_at(0).bounds();
-        assert_eq!(absolute, Rect::new(1, 1, 39, 19));
+        assert_eq!(absolute, Rect::new(1, 1, 40, 19));
     }
 
     /// Regression test for the actual pre-fix bug: passing the window's
@@ -1282,7 +1408,9 @@ mod window_overlap_tests {
             .bounds(window_bounds)
             .title("a")
             .build();
-        let view_a = Rc::new(RefCell::new(StreamView::new(Rect::new(0, 0, 28, 6))));
+        let view_a = Rc::new(RefCell::new(StreamView::new(super::session_view_bounds(
+            window_bounds,
+        ))));
         view_a.borrow_mut().push_line(&line(""));
         view_a.borrow_mut().push_line(&line(""));
         view_a
@@ -1302,7 +1430,9 @@ mod window_overlap_tests {
             .bounds(window_bounds)
             .title("b")
             .build();
-        let view_b = Rc::new(RefCell::new(StreamView::new(Rect::new(0, 0, 28, 6))));
+        let view_b = Rc::new(RefCell::new(StreamView::new(super::session_view_bounds(
+            window_bounds,
+        ))));
         view_b.borrow_mut().push_line(&line("hi"));
         view_b.borrow_mut().push_line(&line("there"));
         window_b.add(Box::new(SharedStreamView(view_b)));
@@ -1325,6 +1455,60 @@ mod window_overlap_tests {
                 "row {absolute_row} column {col} still shows a leftover \
                  character from window A: {:?}",
                 grid[absolute_row]
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod desktop_background_tests {
+    use super::title_render_tests::NullBackend;
+    use turbo_vision::core::geometry::Rect;
+    use turbo_vision::terminal::Terminal;
+    use turbo_vision::views::desktop::Desktop;
+    use turbo_vision::views::view::View;
+
+    /// Widening the desktop (a terminal resize) must repaint the new
+    /// columns too.
+    ///
+    /// It used not to: `Desktop::new` built its `Background` with the size
+    /// the desktop had at startup, and `Background` carried no grow mode,
+    /// so `Group::set_bounds` only *translated* it and never grew it. Every
+    /// column the terminal gained after startup stayed unpainted — the
+    /// black band down the right edge. Fixed in `turbo-vision` itself
+    /// (`Background` now defaults to `GF_GROW_HI_X | GF_GROW_HI_Y`, which is
+    /// Borland's `TBackground` growMode); this test only passes against a
+    /// library that carries that fix.
+    #[test]
+    fn background_covers_every_column_after_a_widening_resize() {
+        let mut terminal = Terminal::with_backend(Box::new(NullBackend)).unwrap();
+        let mut desktop = Desktop::new(Rect::new(0, 0, 78, 25));
+        desktop.set_bounds(Rect::new(0, 1, 80, 24));
+        desktop.draw(&mut terminal);
+        for y in 1..24usize {
+            let row: String = terminal.buffer()[y].iter().map(|c| c.ch).collect();
+            assert_eq!(
+                row.chars().filter(|c| *c == '\u{2591}').count(),
+                80,
+                "row {y}: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn background_covers_every_desktop_column() {
+        let mut terminal = Terminal::with_backend(Box::new(NullBackend)).unwrap();
+        let mut desktop = Desktop::new(Rect::new(0, 0, 80, 25));
+        // What Application::update_desktop_bounds does once a menu bar and
+        // a status line are installed.
+        desktop.set_bounds(Rect::new(0, 1, 80, 24));
+        desktop.draw(&mut terminal);
+        for y in 1..24usize {
+            let row: String = terminal.buffer()[y].iter().map(|c| c.ch).collect();
+            assert_eq!(
+                row.chars().filter(|c| *c == '░').count(),
+                80,
+                "row {y}: {row:?}"
             );
         }
     }

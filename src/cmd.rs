@@ -32,3 +32,6 @@ pub const CM_TILE_WINDOWS: CommandId = 1006;
 /// ids are ours alone; nothing else touches their enabled state, and
 /// `Console::handle_command` maps them onto `Application::tile` / `cascade`.
 pub const CM_CASCADE_WINDOWS: CommandId = 1007;
+
+/// Window > Auto-cleanup (a flag: close each window as its client goes away)
+pub const CM_AUTO_CLEANUP: CommandId = 1008;

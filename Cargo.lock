@@ -1086,9 +1086,9 @@ dependencies = [
 
 [[package]]
 name = "turbo-vision"
-version = "2.2.1"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0b2f7ebd0480a1f4c85fff4756fae452336e4fc3d0f051e389955893589c5bd"
+checksum = "c490df69889c152702dffe070905a243567bcc42b98188317df4c328729e8f2a"
 dependencies = [
  "arboard",
  "base64",

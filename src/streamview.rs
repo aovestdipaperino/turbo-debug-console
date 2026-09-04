@@ -25,11 +25,38 @@ struct SelPos {
     col: usize,
 }
 
-/// An active (continuous) selection between two carets.
+/// The shape a selection takes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SelMode {
+    /// Everything between the two carets in reading order, wrapping at the
+    /// end of each row.
+    Stream,
+    /// The rectangular column band between the two carets, taken from every
+    /// row they span.
+    Block,
+}
+
+/// An active selection between two carets.
+///
+/// The shape is fixed when the selection starts, the way `Editor` fixes its
+/// own `selection_mode`: toggling Edit > Block mode mid-drag would otherwise
+/// change what is already highlighted under the pointer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Selection {
     anchor: SelPos,
     head: SelPos,
+    mode: SelMode,
+}
+
+impl SelMode {
+    /// The shape implied by the global block-edit mode (Edit > Block mode).
+    fn from_global() -> Self {
+        if turbo_vision::core::state::block_edit_mode() {
+            Self::Block
+        } else {
+            Self::Stream
+        }
+    }
 }
 
 /// Swaps foreground and background, preserving text style — the highlight for
@@ -45,6 +72,18 @@ fn order(a: SelPos, b: SelPos) -> (SelPos, SelPos) {
     } else {
         (b, a)
     }
+}
+
+/// The row span and half-open column band of a rectangular selection, as
+/// `(top, bottom, left, right)`. Either caret may be the top-left one.
+fn block_bounds(sel: Selection) -> (usize, usize, usize, usize) {
+    let (a, b) = (sel.anchor, sel.head);
+    (
+        a.row.min(b.row),
+        a.row.max(b.row),
+        a.col.min(b.col),
+        a.col.max(b.col),
+    )
 }
 
 /// A base character immediately followed by U+FE0F (the emoji presentation
@@ -538,6 +577,8 @@ impl StreamView {
                 row: last,
                 col: last_len,
             },
+            // Select All means the whole scrollback, never a column band.
+            mode: SelMode::Stream,
         });
     }
 
@@ -553,6 +594,7 @@ impl StreamView {
                 row: head.0,
                 col: head.1,
             },
+            mode: SelMode::from_global(),
         });
     }
 
@@ -570,6 +612,9 @@ impl StreamView {
     #[must_use]
     pub fn selected_text(&self) -> Option<String> {
         let sel = self.selection?;
+        if sel.mode == SelMode::Block {
+            return Some(self.block_text(sel));
+        }
         let (start, end) = order(sel.anchor, sel.head);
         let mut out = String::new();
         for row in start.row..=end.row {
@@ -591,14 +636,44 @@ impl StreamView {
         Some(out)
     }
 
+    /// The text of a rectangular selection: the column band `[left, right)`
+    /// taken from every row the two carets span, one line per row. Rows
+    /// shorter than `left` contribute an empty line, so the block keeps its
+    /// shape when it is pasted elsewhere.
+    fn block_text(&self, sel: Selection) -> String {
+        let (top, bottom, left, right) = block_bounds(sel);
+        let mut out = String::new();
+        for row in top..=bottom {
+            if row > top {
+                out.push('\n');
+            }
+            let Some(cells) = self.row_at(row) else {
+                continue;
+            };
+            let from = left.min(cells.len());
+            let to = right.min(cells.len());
+            out.extend(
+                cells[from..to.max(from)]
+                    .iter()
+                    .map(|c| c.ch)
+                    .filter(|&ch| ch != '\0'),
+            );
+        }
+        out
+    }
+
     fn row_at(&self, idx: usize) -> Option<&Vec<Cell>> {
         self.iter_rows().nth(idx)
     }
 
     /// Maps a screen position to a caret in the scrollback, or `None` if it
-    /// falls outside the view or below the last row. The column is clamped to
-    /// the hit row's length, so dragging past a line's end caps at its end.
-    fn hit(&self, pos: Point) -> Option<SelPos> {
+    /// falls outside the view or below the last row.
+    ///
+    /// In stream mode the column is clamped to the hit row's length, so
+    /// dragging past a line's end caps at its end. A block selection keeps
+    /// the raw column instead: its column band is the same on every row it
+    /// spans, including rows too short to reach it.
+    fn hit(&self, pos: Point, mode: SelMode) -> Option<SelPos> {
         let x = usize::try_from(pos.x - self.bounds.a.x).ok()?;
         let y = usize::try_from(pos.y - self.bounds.a.y).ok()?;
         if y >= self.page() || x >= self.width() {
@@ -606,10 +681,11 @@ impl StreamView {
         }
         let abs_row = self.top + y;
         let len = self.row_at(abs_row)?.len();
-        Some(SelPos {
-            row: abs_row,
-            col: x.min(len),
-        })
+        let col = match mode {
+            SelMode::Stream => x.min(len),
+            SelMode::Block => x,
+        };
+        Some(SelPos { row: abs_row, col })
     }
 
     /// Whether the cell at absolute wrapped-row `abs_row`, column `col` (a cell
@@ -618,6 +694,10 @@ impl StreamView {
         let Some(sel) = self.selection else {
             return false;
         };
+        if sel.mode == SelMode::Block {
+            let (top, bottom, left, right) = block_bounds(sel);
+            return (top..=bottom).contains(&abs_row) && (left..right).contains(&col);
+        }
         let (s, e) = order(sel.anchor, sel.head);
         (abs_row, col) >= (s.row, s.col) && (abs_row, col) < (e.row, e.col)
     }
@@ -767,19 +847,23 @@ impl View for StreamView {
                 event.clear();
             }
             EventType::MouseDown if event.mouse.buttons & MB_LEFT_BUTTON != 0 => {
-                let Some(pos) = self.hit(event.mouse.pos) else {
+                let mode = SelMode::from_global();
+                let Some(pos) = self.hit(event.mouse.pos, mode) else {
                     return;
                 };
                 self.selection = Some(Selection {
                     anchor: pos,
                     head: pos,
+                    mode,
                 });
                 event.clear();
             }
             EventType::MouseMove | EventType::MouseAuto
                 if event.mouse.buttons & MB_LEFT_BUTTON != 0 =>
             {
-                if let (Some(mut sel), Some(pos)) = (self.selection, self.hit(event.mouse.pos)) {
+                if let Some(mut sel) = self.selection
+                    && let Some(pos) = self.hit(event.mouse.pos, sel.mode)
+                {
                     sel.head = pos;
                     self.selection = Some(sel);
                     event.clear();
@@ -918,6 +1002,114 @@ mod tests {
         let mut up = Event::mouse(EventType::MouseUp, Point::new(3, 1), 0, false);
         v.handle_event(&mut up);
         assert_eq!(v.selected_text().unwrap(), "llo\nwor");
+    }
+
+    /// Serializes the tests that flip the process-wide block-edit mode, and
+    /// clears it again when the guard drops.
+    struct BlockModeGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl BlockModeGuard {
+        fn on() -> Self {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let guard = LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            turbo_vision::core::state::set_block_edit_mode(true);
+            Self(guard)
+        }
+    }
+
+    impl Drop for BlockModeGuard {
+        fn drop(&mut self) {
+            turbo_vision::core::state::set_block_edit_mode(false);
+        }
+    }
+
+    #[test]
+    fn block_mode_selects_a_column_band_from_every_row_it_spans() {
+        let _guard = BlockModeGuard::on();
+        let mut v = view();
+        v.push_line(&line("abcdef"));
+        v.push_line(&line("gh"));
+        v.push_line(&line("klmnop"));
+        // Cols 2..5 of rows 0..=2. "gh" is too short to reach the band.
+        v.set_selection((0, 2), (2, 5));
+        assert_eq!(
+            v.selected_text().unwrap(),
+            "cde
+
+mno"
+        );
+    }
+
+    #[test]
+    fn a_block_drag_keeps_its_column_band_over_a_short_row() {
+        let _guard = BlockModeGuard::on();
+        let mut v = view();
+        v.push_line(&line("abcdef"));
+        v.push_line(&line("gh"));
+        v.push_line(&line("klmnop"));
+        let mut down = Event::mouse(
+            EventType::MouseDown,
+            Point::new(2, 0),
+            MB_LEFT_BUTTON,
+            false,
+        );
+        v.handle_event(&mut down);
+        // The drag passes over "gh", whose length would clamp a stream caret
+        // to column 2 and collapse the band.
+        let mut mv = Event::mouse(
+            EventType::MouseMove,
+            Point::new(5, 1),
+            MB_LEFT_BUTTON,
+            false,
+        );
+        v.handle_event(&mut mv);
+        let mut mv = Event::mouse(
+            EventType::MouseMove,
+            Point::new(5, 2),
+            MB_LEFT_BUTTON,
+            false,
+        );
+        v.handle_event(&mut mv);
+        let mut up = Event::mouse(EventType::MouseUp, Point::new(5, 2), 0, false);
+        v.handle_event(&mut up);
+        assert_eq!(
+            v.selected_text().unwrap(),
+            "cde
+
+mno"
+        );
+    }
+
+    #[test]
+    fn block_mode_highlights_only_the_column_band() {
+        let _guard = BlockModeGuard::on();
+        let mut v = view();
+        v.push_line(&line("abcdef"));
+        v.push_line(&line("klmnop"));
+        v.set_selection((0, 2), (1, 5));
+        assert!(v.is_selected(0, 3), "cols 2..5 of row 0 are in the band");
+        assert!(!v.is_selected(0, 5), "col 5 is past the band");
+        assert!(!v.is_selected(1, 1), "col 1 is before the band");
+        assert!(
+            !v.is_selected(0, 1),
+            "a stream selection would have taken the whole tail of row 0"
+        );
+    }
+
+    #[test]
+    fn select_all_stays_a_stream_selection_in_block_mode() {
+        let _guard = BlockModeGuard::on();
+        let mut v = view();
+        v.push_line(&line("abcdef"));
+        v.push_line(&line("gh"));
+        v.select_all();
+        assert_eq!(
+            v.selected_text().unwrap(),
+            "abcdef
+gh"
+        );
     }
 
     #[test]

@@ -21,7 +21,7 @@ path = "src/main.rs"
 
 [dependencies]
 trace-stream = "0.1"
-turbo-vision = "2.2"
+turbo-vision = "2.3"
 serde_json = { version = "1", features = ["preserve_order"] }
 unicode-width = "0.2"
 

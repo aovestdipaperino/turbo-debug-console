@@ -134,16 +134,30 @@ mouse and survives scrolling. A selection spanning wrapped lines copies back
 as the original logical lines — a soft wrap does not become a newline. A
 plain click, `Esc`, or new output on that window clears it.
 
+**Edit > Block mode** switches dragging from a stream selection to a
+rectangular one: the column band between the two corners, taken from every
+row it spans, so a column of timestamps or numbers copies out without the
+text around it. Rows too short to reach the band contribute an empty line,
+which keeps the block's shape when it is pasted elsewhere. The mode is
+global, ticked in the menu and marked `▭ Block` at the right end of the
+status line, and each selection keeps the shape it started with — toggling
+mid-drag does not reshape what is already highlighted. Select All is always a
+stream selection: it means the whole scrollback, never a column band.
+
 **File** opens a saved capture into a new window, or writes the focused
 window's transcript out as plain text. **Edit** copies the current selection
-to the clipboard, selects the whole window, and clears a window; thinking
+to the clipboard, selects the whole window, toggles block mode, and clears a
+window; thinking
 text and markdown rendering are always on, not toggles. **Window** cycles,
 tiles and cascades, and **Cleanup** closes every window whose client has gone
 away — the ones whose titles read `[disconnected]` — in one go. That is worth
 having because a new window covers the whole desktop, so older windows sit
 hidden behind the newest one; Cleanup sweeps the dead ones without hunting
 through the stack. Closing a window also tears its session down, releasing
-the port.
+the port. **Auto-cleanup** is the same sweep as a standing rule: with it
+ticked, a window closes the moment its client goes away, rather than sitting
+there marked `[disconnected]`. It is off by default, because a dead window's
+scrollback is usually the thing you wanted to read.
 
 Menu items grey out when they have nothing to act on: Copy until something is
 selected, Save As / Select All / Clear window until a window is focused,
