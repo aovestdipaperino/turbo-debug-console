@@ -1,6 +1,6 @@
 [package]
 name = "turbo-debug-console"
-version = "0.4.0"
+version = "0.5.0"
 description = "Turbo Vision monitor that renders a model-token stream over a socket"
 edition = "2024"
 rust-version = "1.93"
@@ -21,7 +21,7 @@ path = "src/main.rs"
 
 [dependencies]
 trace-stream = "0.1"
-turbo-vision = "2.3"
+turbo-vision = "2.4.1"
 serde_json = { version = "1", features = ["preserve_order"] }
 unicode-width = "0.2"
 
