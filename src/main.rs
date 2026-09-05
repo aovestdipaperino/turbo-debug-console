@@ -15,8 +15,8 @@ use turbo_debug_console::registry::{Server, ServerEvent, SessionId};
 use turbo_debug_console::session::{Sessions, SharedStreamView, format_title};
 use turbo_debug_console::streamview::StreamView;
 use turbo_vision::app::Application;
-use turbo_vision::core::command::{CM_NEXT, CM_QUIT, CM_TOGGLE_BLOCK_MODE};
-use turbo_vision::core::event::{EventType, KB_ALT_X, KB_F6, KB_F10};
+use turbo_vision::core::command::{CM_NEXT, CM_QUIT, CM_TOGGLE_BLOCK_MODE, CM_ZOOM};
+use turbo_vision::core::event::{EventType, KB_ALT_X, KB_F5, KB_F6, KB_F10};
 use turbo_vision::core::geometry::Rect;
 use turbo_vision::core::menu_data::{Menu, MenuItem};
 use turbo_vision::core::state::{SF_CLOSED, SF_SHADOW};
@@ -396,6 +396,18 @@ impl Console {
                 app.disable_command(command);
             }
         }
+        // `CM_ZOOM` starts disabled in Turbo Vision's command set (Borland
+        // `initCommands`) and, unlike `CM_TILE` / `CM_CASCADE`, nothing in
+        // the library re-enables it, so the Window > Zoom item would stay
+        // grey forever. The frame's zoom triangle bypasses the command set
+        // (the desktop acts on the `CM_ZOOM` event directly), so this only
+        // governs the menu item and the F5 key. Any window can be zoomed,
+        // including the last one, so the count threshold is one, not two.
+        if app.desktop.count_tileable_windows() > 0 {
+            app.enable_command(CM_ZOOM);
+        } else {
+            app.disable_command(CM_ZOOM);
+        }
         if self.has_stale_windows() {
             app.enable_command(cmd::CM_CLEANUP);
         } else {
@@ -764,6 +776,7 @@ fn build_menu_bar(width: i16, auto_cleanup: bool) -> MenuBar {
         "~W~indow",
         Menu::from_items(vec![
             MenuItem::new("~N~ext", CM_NEXT, 0, 0),
+            MenuItem::new("~Z~oom", CM_ZOOM, KB_F5, 0),
             MenuItem::new("~T~ile", cmd::CM_TILE_WINDOWS, 0, 0),
             MenuItem::new("C~a~scade", cmd::CM_CASCADE_WINDOWS, 0, 0),
             MenuItem::separator(),
@@ -779,6 +792,7 @@ fn build_status_line(width: i16, height: i16, live: usize) -> StatusLine {
     let mut status_line = StatusLine::new(
         Rect::new(0, height - 1, width, height),
         vec![
+            StatusItem::new("~F5~ Zoom", KB_F5, CM_ZOOM),
             StatusItem::new("~F6~ Next", KB_F6, CM_NEXT),
             StatusItem::new("~F10~ Menu", KB_F10, 0),
             StatusItem::new("~Alt-X~ Exit", KB_ALT_X, CM_QUIT),

@@ -114,6 +114,7 @@ verbatim rather than dropped.
 | | |
 |---|---|
 | `F10` | menu |
+| `F5` | zoom the focused window (also the `[▲]` / `[▼]` button in its title bar) |
 | `F6` | next window |
 | `Alt-X` | quit |
 | `PgUp` / `PgDn` / `Home` / `End` | scroll the focused window |
