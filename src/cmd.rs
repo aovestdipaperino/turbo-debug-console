@@ -35,3 +35,6 @@ pub const CM_CASCADE_WINDOWS: CommandId = 1007;
 
 /// Window > Auto-cleanup (a flag: close each window as its client goes away)
 pub const CM_AUTO_CLEANUP: CommandId = 1008;
+/// Window > Auto-tile (a flag: re-tile the desktop whenever a window opens
+/// or closes, in creation order, left-to-right then top-to-bottom)
+pub const CM_AUTO_TILE: CommandId = 1009;

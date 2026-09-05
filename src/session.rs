@@ -99,10 +99,14 @@ impl SessionState {
     /// called out with a leading `[trace]` tag -- the `name :port` shape
     /// alone gives no hint that a window is rendering structured log
     /// records rather than a token stream, and that distinction matters
-    /// enough at a glance to be worth the few extra characters.
+    /// enough at a glance to be worth the few extra characters. The total
+    /// line count is appended so the title doubles as a live progress
+    /// indicator without a separate status field.
     #[must_use]
     pub fn window_title(&self) -> String {
         let base = format_title(&self.name, self.port);
+        let lines = self.view.borrow().line_count();
+        let base = format!("{base} ({lines} line{})", if lines == 1 { "" } else { "s" });
         let base = match self.kind {
             StreamKind::Tokens => base,
             StreamKind::Trace => format!("[trace] {base}"),
@@ -180,6 +184,17 @@ impl Sessions {
     #[must_use]
     pub fn is_connected(&self, id: SessionId) -> bool {
         self.inner.get(&id).is_some_and(|s| s.connected)
+    }
+
+    /// Total displayed lines for a session's scrollback (completed lines
+    /// plus any in-progress partial line). Unknown ids read as 0. Used to
+    /// decide whether a `Bytes` event changed the line count and so needs a
+    /// title refresh.
+    #[must_use]
+    pub fn line_count(&self, id: SessionId) -> usize {
+        self.inner
+            .get(&id)
+            .map_or(0, |s| s.view.borrow().line_count())
     }
 
     pub fn get_mut(&mut self, id: SessionId) -> Option<&mut SessionState> {
@@ -293,14 +308,14 @@ mod tests {
         sessions.insert(1, "demo".into(), 4242, StreamKind::Tokens, view(), opts());
         assert_eq!(
             sessions.window_title(1).unwrap(),
-            "demo :4242 [disconnected]"
+            "demo :4242 (0 lines) [disconnected]"
         );
         sessions.mark_reconnected(1);
-        assert_eq!(sessions.window_title(1).unwrap(), "demo :4242");
+        assert_eq!(sessions.window_title(1).unwrap(), "demo :4242 (2 lines)");
         sessions.mark_disconnected(1);
         assert_eq!(
             sessions.window_title(1).unwrap(),
-            "demo :4242 [disconnected]"
+            "demo :4242 (2 lines) [disconnected]"
         );
     }
 
@@ -308,9 +323,12 @@ mod tests {
     fn window_title_omits_a_zero_port() {
         let mut sessions = Sessions::default();
         sessions.insert(1, "anon-1".into(), 0, StreamKind::Tokens, view(), opts());
-        assert_eq!(sessions.window_title(1).unwrap(), "anon-1 [disconnected]");
+        assert_eq!(
+            sessions.window_title(1).unwrap(),
+            "anon-1 (0 lines) [disconnected]"
+        );
         sessions.mark_reconnected(1);
-        assert_eq!(sessions.window_title(1).unwrap(), "anon-1");
+        assert_eq!(sessions.window_title(1).unwrap(), "anon-1 (2 lines)");
     }
 
     /// Regression test for defect 1: a session's first-ever attach must
@@ -323,7 +341,7 @@ mod tests {
         let mut sessions = Sessions::default();
         sessions.insert(1, "demo".into(), 4242, StreamKind::Tokens, view(), opts());
         sessions.mark_attached(1, false);
-        assert_eq!(sessions.window_title(1).unwrap(), "demo :4242");
+        assert_eq!(sessions.window_title(1).unwrap(), "demo :4242 (0 lines)");
         assert!(!sessions.plain_text(1).unwrap().contains("reconnected"));
     }
 
@@ -334,7 +352,7 @@ mod tests {
         let mut sessions = Sessions::default();
         sessions.insert(1, "demo".into(), 4242, StreamKind::Tokens, view(), opts());
         sessions.mark_attached(1, true);
-        assert_eq!(sessions.window_title(1).unwrap(), "demo :4242");
+        assert_eq!(sessions.window_title(1).unwrap(), "demo :4242 (2 lines)");
         assert!(sessions.plain_text(1).unwrap().contains("reconnected"));
     }
 
@@ -384,9 +402,12 @@ mod tests {
         sessions.insert(1, "myapp".into(), 4242, StreamKind::Trace, view(), opts());
         assert_eq!(
             sessions.window_title(1).unwrap(),
-            "[trace] myapp :4242 [disconnected]"
+            "[trace] myapp :4242 (0 lines) [disconnected]"
         );
         sessions.mark_reconnected(1);
-        assert_eq!(sessions.window_title(1).unwrap(), "[trace] myapp :4242");
+        assert_eq!(
+            sessions.window_title(1).unwrap(),
+            "[trace] myapp :4242 (2 lines)"
+        );
     }
 }

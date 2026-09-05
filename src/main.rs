@@ -6,6 +6,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use trace_stream::render::RenderOptions;
@@ -50,6 +51,39 @@ const RENDER_OPTIONS: RenderOptions = RenderOptions {
     format_thinking: true,
     format_markdown: true,
 };
+
+// The two Window > Auto-* flags live as process globals rather than on
+// `Console` for one reason: their menu items are `MenuItem::flag`, whose
+// `checked` callback is a plain `fn() -> bool` (it can only read global
+// state, not capture a `Console`). That is the same constraint
+// `block_edit_mode` already meets, and it is what lets the check mark draw
+// in the menu's dedicated tick column -- flush against the text, exactly
+// like Edit > Block mode -- instead of being embedded in the item's text
+// string and so landing a column too far right with a space on each side.
+// `decide_server_event` reads these via the accessors below; it touches no
+// `Application`, so the decision seam stays TTY-free and unit-testable.
+static AUTO_CLEANUP: AtomicBool = AtomicBool::new(false);
+static AUTO_TILE: AtomicBool = AtomicBool::new(false);
+
+/// Is Window > Auto-cleanup currently on?
+fn auto_cleanup_enabled() -> bool {
+    AUTO_CLEANUP.load(Ordering::Relaxed)
+}
+
+/// Turn Window > Auto-cleanup on or off.
+fn set_auto_cleanup(on: bool) {
+    AUTO_CLEANUP.store(on, Ordering::Relaxed);
+}
+
+/// Is Window > Auto-tile currently on?
+fn auto_tile_enabled() -> bool {
+    AUTO_TILE.load(Ordering::Relaxed)
+}
+
+/// Turn Window > Auto-tile on or off.
+fn set_auto_tile(on: bool) {
+    AUTO_TILE.store(on, Ordering::Relaxed);
+}
 
 /// Handles `--version` / `--help` and exits, before any terminal setup.
 ///
@@ -116,7 +150,7 @@ fn main() -> turbo_vision::core::error::Result<()> {
 
     let mut app = Application::new()?;
     let (width, height) = app.terminal.size();
-    app.set_menu_bar(build_menu_bar(width, false));
+    app.set_menu_bar(build_menu_bar(width));
     app.set_status_line(build_status_line(width, height, 0));
 
     let mut server = match Server::bind(CONTROL_PORT) {
@@ -202,6 +236,13 @@ fn main() -> turbo_vision::core::error::Result<()> {
 
         if app.desktop.remove_closed_windows() {
             console.forget_closed_windows(&app, &mut server);
+            // A window leaving changes the tile grid; with Auto-tile on,
+            // re-lay the remaining windows at once so the desktop does not
+            // briefly show the old layout with a gap where the closed
+            // window was.
+            if auto_tile_enabled() {
+                console.tile_windows(&mut app);
+            }
             app.draw();
             let _ = app.terminal.flush();
         }
@@ -227,12 +268,11 @@ struct Console {
     sessions: Sessions,
     window_ids: HashMap<ViewId, SessionId>,
     session_windows: HashMap<SessionId, ViewId>,
-    /// Window > Auto-cleanup: when set, a window is closed the moment its
-    /// client goes away, instead of waiting for a manual Window > Cleanup.
-    /// Off by default — the disconnected window and its scrollback are still
-    /// the interesting thing to read after a crash, so throwing it away has
-    /// to be asked for.
-    auto_cleanup: bool,
+    /// When each tracked window was created, so tiling can lay windows out
+    /// oldest-to-newest, left-to-right then top-to-bottom. Keyed by the
+    /// same `ViewId` as `window_ids`; pruned alongside it in
+    /// `forget_closed_windows`.
+    window_created: HashMap<ViewId, Instant>,
 }
 
 /// What a decided [`ServerEvent`] means for the desktop: create a window for
@@ -291,18 +331,28 @@ impl Console {
             cmd::CM_OPEN_CAPTURE => self.open_capture(app),
             cmd::CM_CLEANUP => self.cleanup_windows(app),
             cmd::CM_AUTO_CLEANUP => {
-                self.auto_cleanup = !self.auto_cleanup;
-                // Rebuild the menu bar so the item's tick follows the flag,
-                // then act on it at once: switching it on with dead windows
-                // already on screen should sweep them, not wait for the next
-                // client to go away.
-                let (width, _) = app.terminal.size();
-                app.set_menu_bar(build_menu_bar(width, self.auto_cleanup));
-                if self.auto_cleanup {
+                let on = !auto_cleanup_enabled();
+                set_auto_cleanup(on);
+                // Act on it at once: switching it on with dead windows
+                // already on screen should sweep them, not wait for the
+                // next client to go away. The menu tick follows the flag
+                // on the next draw (the item is a `MenuItem::flag`), so no
+                // menu rebuild is needed.
+                if on {
                     self.cleanup_windows(app);
                 }
             }
-            cmd::CM_TILE_WINDOWS => app.tile(),
+            cmd::CM_AUTO_TILE => {
+                let on = !auto_tile_enabled();
+                set_auto_tile(on);
+                // Tiling at once on enable matches Auto-cleanup's
+                // "sweep now" behaviour: turning it on with windows already
+                // open should arrange them, not wait for the next open.
+                if on {
+                    self.tile_windows(app);
+                }
+            }
+            cmd::CM_TILE_WINDOWS => self.tile_windows(app),
             cmd::CM_CASCADE_WINDOWS => app.cascade(),
             _ => {}
         }
@@ -324,6 +374,56 @@ impl Console {
         for view_id in stale {
             if let Some(view) = app.desktop.child_by_id_mut(view_id) {
                 view.set_state_flag(SF_CLOSED, true);
+            }
+        }
+    }
+
+    /// Tile every tracked window still on the desktop, laid out
+    /// oldest-to-newest in reading order: left-to-right, then top-to-bottom.
+    ///
+    /// This replaces Turbo Vision's own `Application::tile`, which walks the
+    /// desktop's children in z-order (the order windows were focused, not
+    /// created) and fills the grid column-major (top-to-bottom, then
+    /// left-to-right). Sorting by the recorded creation timestamp and filling
+    /// row-major gives the requested reading order, so the first session to
+    /// connect stays top-left as later ones arrive.
+    ///
+    /// The grid shape (`tile_cols`) is the same near-square divisor Turbo
+    /// Vision picks, so the layout matches what `Application::tile` would
+    /// have produced for the same window count — only the assignment of
+    /// windows to cells changes.
+    fn tile_windows(&mut self, app: &mut Application) {
+        let rect = app.get_tile_rect();
+        // Collect the windows we still track that are still on the desktop,
+        // paired with when they were created. Windows we have forgotten about
+        // (a closed window mid-teardown) are skipped via `contains_id`.
+        let mut windows: Vec<(ViewId, Instant)> = self
+            .window_ids
+            .keys()
+            .copied()
+            .filter(|vid| app.desktop.contains_id(*vid))
+            .filter_map(|vid| self.window_created.get(&vid).map(|&t| (vid, t)))
+            .collect();
+        if windows.is_empty() {
+            return;
+        }
+        // Oldest first: stable sort keeps equal-timestamp windows in their
+        // insertion order, which is the order they were added to the desktop.
+        windows.sort_by_key(|&(_, t)| t);
+        let n = windows.len();
+        let cols = tile_cols(n);
+        let rows = n.div_ceil(cols);
+        for (i, (view_id, _)) in windows.iter().enumerate() {
+            let row = i / cols;
+            let col = i % cols;
+            let bounds = Rect::new(
+                divider_loc(rect.a.x, rect.b.x, cols, col),
+                divider_loc(rect.a.y, rect.b.y, rows, row),
+                divider_loc(rect.a.x, rect.b.x, cols, col + 1),
+                divider_loc(rect.a.y, rect.b.y, rows, row + 1),
+            );
+            if let Some(view) = app.desktop.child_by_id_mut(*view_id) {
+                view.set_bounds(bounds);
             }
         }
     }
@@ -447,8 +547,20 @@ impl Console {
                 self.retitle_intent(id)
             }
             ServerEvent::Bytes { id, data } => {
+                // The window title carries the live line count, so a `Bytes`
+                // event that changes it must refresh the title. Comparing
+                // before/after means a burst with no new line (a long
+                // partial still being filled in) does not retitle on every
+                // chunk. Only sessions with a mapped window can retitle;
+                // `retitle_intent` returns `None` for the rest, so this is
+                // still a no-op intent for unmapped sessions.
+                let before = self.sessions.line_count(id);
                 self.sessions.feed(id, &data);
-                None
+                if self.sessions.line_count(id) == before {
+                    None
+                } else {
+                    self.retitle_intent(id)
+                }
             }
             ServerEvent::Disconnected { id } => {
                 self.sessions.mark_disconnected(id);
@@ -457,7 +569,7 @@ impl Console {
                 // here: the main loop's `remove_closed_windows` sweep and
                 // `forget_closed_windows` drop the session and tear the
                 // server side down, exactly as for a hand-closed window.
-                if self.auto_cleanup
+                if auto_cleanup_enabled()
                     && let Some(&view_id) = self.session_windows.get(&id)
                 {
                     return Some(ConsoleIntent::CloseWindow { view_id });
@@ -536,6 +648,13 @@ impl Console {
                 let view_id = app.desktop.add(Box::new(window));
                 self.window_ids.insert(view_id, id);
                 self.session_windows.insert(id, view_id);
+                self.window_created.insert(view_id, Instant::now());
+                // With Auto-tile on, every new window triggers a re-tile so
+                // the desktop settles into its final layout immediately,
+                // oldest-to-newest left-to-right then top-to-bottom.
+                if auto_tile_enabled() {
+                    self.tile_windows(app);
+                }
             }
             ConsoleIntent::Retitle { view_id, title } => {
                 if let Some(view) = app.desktop.child_by_id_mut(view_id)
@@ -589,6 +708,8 @@ impl Console {
             .retain(|view_id, _| app.desktop.contains_id(*view_id));
         self.session_windows
             .retain(|_, view_id| app.desktop.contains_id(*view_id));
+        self.window_created
+            .retain(|view_id, _| app.desktop.contains_id(*view_id));
         for id in closed {
             self.sessions.remove(id);
             server.close_session(id);
@@ -643,15 +764,26 @@ impl Console {
             state.finish();
         }
 
+        // Title from the session so it carries the line count, like a live
+        // session window. The capture is already connected and fully fed, so
+        // this reads the final line count, not 0.
+        let title = self
+            .sessions
+            .window_title(id)
+            .unwrap_or_else(|| name.clone());
         let mut window = WindowBuilder::new()
             .bounds(window_bounds)
-            .title(name)
+            .title(title)
             .build();
         apply_session_window_palette(&mut window);
         drop_window_shadow(&mut window);
         window.add(Box::new(SharedStreamView(view)));
         let view_id = app.desktop.add(Box::new(window));
         self.window_ids.insert(view_id, id);
+        self.window_created.insert(view_id, Instant::now());
+        if auto_tile_enabled() {
+            self.tile_windows(app);
+        }
     }
 }
 
@@ -667,6 +799,33 @@ impl Console {
 /// (title bar included) above row 0.
 fn tile_window_bounds(app: &Application) -> Rect {
     app.get_tile_rect()
+}
+
+/// Number of columns for a row-major tile grid of `n` windows: the larger
+/// factor of `n` nearest its square root, matching Turbo Vision's
+/// `mostEqualDivisors`. The row count is `n.div_ceil(cols)`, computed by the
+/// caller, so a non-factor `n` simply leaves the last row partially empty
+/// rather than stretching cells.
+fn tile_cols(n: usize) -> usize {
+    let mut i = n.isqrt().max(1);
+    if !n.is_multiple_of(i) && n.is_multiple_of(i + 1) {
+        i += 1;
+    }
+    if i < n / i {
+        i = n / i;
+    }
+    i
+}
+
+/// Boundary of part `pos` when `[lo, hi)` is split into `num` near-equal
+/// parts. Matches Turbo Vision's `dividerLoc`. The grid is tiny (a handful
+/// of windows) and the span is a screen dimension, so the intermediate
+/// `i32` never overflows and the result always fits an `i16` coordinate.
+fn divider_loc(lo: i16, hi: i16, num: usize, pos: usize) -> i16 {
+    let span = i32::from(hi - lo);
+    let num = i32::try_from(num).expect("tile grid fits in i32");
+    let pos = i32::try_from(pos).expect("tile grid fits in i32");
+    lo + i16::try_from(span * pos / num).expect("tile coordinate fits in i16")
 }
 
 /// Clears `SF_SHADOW`. A window that covers the desktop has nothing to cast
@@ -722,25 +881,7 @@ fn apply_session_window_palette(window: &mut Window) {
     window.set_custom_palette(vec![97, 98, 99, 100, 101, 102, 103, 104]);
 }
 
-/// The Window > Auto-cleanup item, ticked when the flag is on. Unlike Edit >
-/// Block mode this cannot be a `MenuItem::flag`: that item's `checked`
-/// callback is a plain `fn() -> bool`, so it can only read global state, and
-/// auto-cleanup belongs to this `Console`. The state is carried in the item's
-/// text instead and the menu bar is rebuilt on each toggle. The leading
-/// character is a space when off rather than nothing at all, so the item's
-/// text — and with it the dropdown's width — does not change size as it is
-/// toggled.
-fn auto_cleanup_item(enabled: bool) -> MenuItem {
-    let mark = if enabled { '√' } else { ' ' };
-    MenuItem::new(
-        &format!("{mark} Auto-cleanu~p~"),
-        cmd::CM_AUTO_CLEANUP,
-        0,
-        0,
-    )
-}
-
-fn build_menu_bar(width: i16, auto_cleanup: bool) -> MenuBar {
+fn build_menu_bar(width: i16) -> MenuBar {
     let mut menu_bar = MenuBar::new(Rect::new(0, 0, width, 1));
 
     menu_bar.add_submenu(SubMenu::new(
@@ -781,7 +922,20 @@ fn build_menu_bar(width: i16, auto_cleanup: bool) -> MenuBar {
             MenuItem::new("C~a~scade", cmd::CM_CASCADE_WINDOWS, 0, 0),
             MenuItem::separator(),
             MenuItem::new("Clean~u~p", cmd::CM_CLEANUP, 0, 0),
-            auto_cleanup_item(auto_cleanup),
+            // Flag items, so the tick draws in the menu's dedicated check
+            // column — flush against the text, exactly like Edit > Block
+            // mode — rather than embedded in the item's text string. The
+            // `checked` callback is a plain `fn() -> bool`, so the flags
+            // live as process globals (see `AUTO_CLEANUP` / `AUTO_TILE`)
+            // and are re-read on every draw, no menu rebuild on toggle.
+            MenuItem::flag(
+                "Auto-cleanu~p~",
+                cmd::CM_AUTO_CLEANUP,
+                0,
+                0,
+                auto_cleanup_enabled,
+            ),
+            MenuItem::flag("Auto-til~e~", cmd::CM_AUTO_TILE, 0, 0, auto_tile_enabled),
         ]),
     ));
 
@@ -856,6 +1010,11 @@ mod console_decision_tests {
     /// window; with it on, the same event closes the window instead.
     #[test]
     fn auto_cleanup_turns_a_disconnect_into_a_window_close() {
+        // The flag is a process global shared with the menu's `checked`
+        // callback; reset it at the start so a prior test that left it on
+        // cannot flip this test's "off" assertion, and at the end so a
+        // later concurrent test is not affected.
+        set_auto_cleanup(false);
         let mut console = Console::default();
         console.sessions.insert(
             1,
@@ -877,12 +1036,13 @@ mod console_decision_tests {
             "with the flag off a disconnect must only mark the title"
         );
 
-        console.auto_cleanup = true;
+        set_auto_cleanup(true);
         assert_eq!(
             console.decide_server_event(ServerEvent::Disconnected { id: 1 }),
             Some(ConsoleIntent::CloseWindow { view_id }),
             "with the flag on a disconnect must close the window"
         );
+        set_auto_cleanup(false);
     }
 
     #[test]
@@ -1002,7 +1162,7 @@ mod console_decision_tests {
             intent,
             Some(ConsoleIntent::Retitle {
                 view_id,
-                title: "demo :4242".into(),
+                title: "demo :4242 (2 lines)".into(),
             })
         );
     }
@@ -1035,7 +1195,7 @@ mod console_decision_tests {
             intent,
             Some(ConsoleIntent::Retitle {
                 view_id,
-                title: "demo :4242".into(),
+                title: "demo :4242 (0 lines)".into(),
             })
         );
     }
